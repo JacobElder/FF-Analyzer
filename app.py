@@ -1,73 +1,102 @@
-import streamlit as st
-import pandas as pd
+import os
+from datetime import datetime, timezone
+
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
+from dotenv import load_dotenv
 
-from src.agent import FantasyAgent, DEFAULT_SCORING
-from src.state_manager import get_roster, update_roster, get_league_list
+from src.agent import FantasyAgent
+from src.defense import EMPTY_MATCHUP, build_matchup_table, compute_defense_rankings, get_matchup_info
 from src.evaluator import (
-    score_waiver, score_trade,
-    rank_players, player_value, compute_positional_scarcity,
-    analyze_roster_construction, recommend_drop,
+    DEFAULT_ROSTER_POSITIONS, analyze_roster_construction, compute_positional_scarcity,
+    injury_factor, rank_players, recommend_drop, score_trade, score_waiver, starter_counts,
 )
-from src.sleeper_integration import sync_sleeper_league
-from src.wrangler import (
-    fetch_weekly_stats, get_player_stats, rank_available_players,
-    get_usage_trends, current_nfl_season,
+from src.injuries import build_injury_map, injury_status, is_inactive
+from src.players import RELEVANT_POSITIONS, build_sleeper_name_index, enrich_with_ids, player_label, sleeper_to_player
+from src.schedule import (
+    fetch_schedules, get_playoff_schedule_strength, get_weather_for_game, next_game_map, playoff_weeks_for,
 )
-from src.simulator import simulate_multi_start, simulate_start_sit, simulate_trade, simulate_player, _summary
-from src.defense import compute_defense_rankings, get_matchup_info
-from src.schedule import fetch_schedules, get_next_game, get_weather_for_game, get_playoff_schedule_strength
-from src.injuries import fetch_injury_report, injury_badge
+from src.scoring import compute_fantasy_points, effective_scoring, scoring_key, scoring_label
+from src.simulator import (
+    _summary, simulate_lineup_change, simulate_multi_start, simulate_player, simulate_start_sit, simulate_trade,
+)
+from src.sleeper_integration import fetch_all_players, players_db_age_seconds, sync_sleeper_league
+from src.state_manager import list_leagues, load_league, save_league
 from src.vegas import fetch_implied_totals
+from src.wrangler import StatsIndex, current_nfl_season, fetch_weekly_stats
+
+load_dotenv()
 
 st.set_page_config(page_title="FF Analyzer", layout="wide")
 st.title("🏈 FF Analyzer")
 
+STALE_SYNC_DAYS = 2
+
 
 # ── Cached loaders ────────────────────────────────────────────────────────────
+# Large read-only objects use cache_resource (no per-rerun copy); the file
+# caches underneath keep data across app restarts.
 
-@st.cache_data(ttl=86400)
+@st.cache_resource(ttl=6 * 3600, show_spinner="Loading NFL stats…")
 def load_weekly_stats():
-    df = fetch_weekly_stats()
-    season = int(df["season"].iloc[0]) if not df.empty and "season" in df.columns else current_nfl_season()
-    return df, season
+    return fetch_weekly_stats()
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def load_schedules():
     return fetch_schedules()
 
-@st.cache_data(ttl=14400)   # 4h during season
-def load_injuries():
-    return fetch_injury_report()
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_next_games():
+    return next_game_map(load_schedules())
 
-@st.cache_data(ttl=3600)    # 1h
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_vegas():
     return fetch_implied_totals()
 
-@st.cache_data(ttl=604800)
-def load_sleeper_players():
-    from src.sleeper_integration import fetch_all_players
-    return fetch_all_players()
+@st.cache_resource(ttl=6 * 3600, show_spinner="Loading Sleeper player database…")
+def load_players_db():
+    db = fetch_all_players()
+    name_index = build_sleeper_name_index(db)
+    injuries = build_injury_map(db)
+    trade_pool = sorted(
+        (sleeper_to_player(pid, info) for pid, info in db.items()
+         if info.get("active") and info.get("team") and info.get("position") in RELEVANT_POSITIONS),
+        key=lambda p: p["name"],
+    )
+    return db, name_index, injuries, trade_pool
+
+@st.cache_resource(ttl=6 * 3600, show_spinner="Scoring players for this league…")
+def load_analytics(scoring_items: tuple, num_teams: int, roster_positions: tuple):
+    df = load_weekly_stats()
+    if not df.empty:
+        df = df.assign(fp=compute_fantasy_points(df, dict(scoring_items)))
+    index = StatsIndex(df)
+    matchups = build_matchup_table(compute_defense_rankings(df))
+    repl = compute_positional_scarcity(index, starter_counts(num_teams, list(roster_positions)))
+    return index, matchups, repl
+
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def cached_weather(home_team: str, gameday: str):
+    return get_weather_for_game(home_team, gameday)
 
 
-# ── Session state ─────────────────────────────────────────────────────────────
+def refresh_all_data():
+    fetch_weekly_stats(force=True)
+    fetch_schedules(force=True)
+    fetch_all_players(force=True)
+    fetch_implied_totals(force=True)
+    st.cache_data.clear()
+    st.cache_resource.clear()
+
+
+# ── Sidebar: settings, data, league ───────────────────────────────────────────
 
 if "ai_provider" not in st.session_state:
-    st.session_state.ai_provider = "claude"
-
-
-# ── Load data up front ────────────────────────────────────────────────────────
-
-_weekly_df, _season_year = load_weekly_stats()
-_schedules_df = load_schedules()
-_injury_map = load_injuries()
-_vegas_totals = load_vegas()
-st.caption(f"Stats: {_season_year} NFL season")
-
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+    # Default to whichever provider has a key configured
+    st.session_state.ai_provider = "gemini" if os.getenv("GOOGLE_API_KEY") and not os.getenv("ANTHROPIC_API_KEY") else "claude"
 
 st.sidebar.header("⚙️ Settings")
 st.session_state.ai_provider = st.sidebar.radio(
@@ -75,72 +104,153 @@ st.session_state.ai_provider = st.sidebar.radio(
     index=0 if st.session_state.ai_provider == "claude" else 1,
     format_func=lambda x: "Claude (Anthropic)" if x == "claude" else "Gemini (Google)",
 )
+if st.sidebar.button("🔄 Refresh data", help="Re-download stats, schedule, Sleeper players/injuries and odds"):
+    with st.spinner("Refreshing all data sources…"):
+        refresh_all_data()
+    st.rerun()
 
 st.sidebar.divider()
 st.sidebar.header("📁 League")
-leagues = get_league_list()
-selected_league = st.sidebar.selectbox("Select League", leagues)
 
-with st.sidebar.expander("➕ Sync from Sleeper"):
-    sleeper_user = st.text_input("Sleeper Username", value="JElder52")
-    target_l_name = st.text_input("League ID or Name", value="1236161337357242368")
+if flash := st.session_state.pop("flash", None):
+    st.sidebar.success(flash)
+
+with st.sidebar.expander("➕ Sync from Sleeper", expanded=not list_leagues()):
+    sleeper_user = st.text_input("Sleeper Username", value=os.getenv("SLEEPER_USERNAME", ""))
+    target_league = st.text_input("League ID or Name", value=os.getenv("SLEEPER_LEAGUE", ""),
+                                  help="Sleeper issues a new league ID every season — the name always finds the current one.")
     if st.button("Sync"):
         with st.spinner("Syncing from Sleeper..."):
-            data, err = sync_sleeper_league(sleeper_user, target_l_name)
-            if data:
-                update_roster(data, target_l_name)
-                st.success(f"Synced: {data['team_name']}")
-                st.rerun()
-            else:
-                st.error(err)
-
-current_data = get_roster(selected_league)
-roster = current_data.get("roster", [])
-scoring = current_data.get("scoring_settings") or DEFAULT_SCORING
-waivers = current_data.get("waivers", [])
-
-synced_budget = current_data.get("budget", 100)
-with st.sidebar.expander("💰 FAAB Budget", expanded=True):
-    new_budget = st.number_input(
-        "Current Budget ($)", min_value=0, max_value=10000,
-        value=int(synced_budget), step=1,
-    )
-    if new_budget != synced_budget:
-        if st.button("Save Budget"):
-            current_data["budget"] = new_budget
-            update_roster(current_data, selected_league)
+            data, err = sync_sleeper_league(sleeper_user.strip(), target_league.strip())
+        if data:
+            st.session_state.league_key = save_league(data)
+            st.session_state.flash = f"Synced: {data['league_name']} ({data['season']})"
             st.rerun()
-budget = new_budget
+        else:
+            st.error(err)
 
-st.sidebar.divider()
-st.sidebar.header("📋 Roster")
-if roster:
-    roster_df_sidebar = pd.DataFrame(roster)[["name", "position"]]
-    # Inject injury badges
-    roster_df_sidebar["status"] = roster_df_sidebar["name"].apply(
-        lambda n: injury_badge(n, _injury_map) or "✅"
-    )
-    st.sidebar.dataframe(roster_df_sidebar, hide_index=True, use_container_width=True)
+leagues = list_leagues()
+league_labels = dict(leagues)
+if leagues:
+    if st.session_state.get("league_key") not in league_labels:
+        st.session_state.league_key = leagues[0][0]
+    selected_league = st.sidebar.selectbox("Select League", list(league_labels), key="league_key",
+                                           format_func=league_labels.get)
+    current_data = load_league(selected_league)
 else:
-    st.sidebar.info("No roster. Sync a league first.")
+    selected_league = None
+    current_data = {}
+    st.sidebar.info("No leagues yet — sync one above.")
 
 
-# ── Shared computations ───────────────────────────────────────────────────────
+# ── Data loading ──────────────────────────────────────────────────────────────
 
-# Defense rankings from the loaded weekly_df (free — no extra API)
-@st.cache_data(ttl=86400)
-def _defense_rankings(scoring_key: str):
-    # scoring_key is just a hashable proxy for the scoring dict
-    return compute_defense_rankings(_weekly_df, scoring)
+_weekly_df = load_weekly_stats()
+if _weekly_df.empty:
+    st.error("Couldn't load NFL stats from nflverse and no cached copy exists. "
+             "Check your connection and click **🔄 Refresh data**.")
+    st.stop()
 
-_defense_df = _defense_rankings(str(sorted(scoring.items())))
+_schedules_df = load_schedules()
+_next_games = load_next_games()
+_vegas_totals = load_vegas()
+_players_db, _name_index, _injury_map, _trade_pool = load_players_db()
 
-# Dynamic replacement levels
-@st.cache_data(ttl=86400)
-def _replacement_levels():
-    return compute_positional_scarcity(_weekly_df, scoring)
+scoring = effective_scoring(current_data.get("scoring_settings"))
+roster_positions = current_data.get("roster_positions") or DEFAULT_ROSTER_POSITIONS
+num_teams = int(current_data.get("total_rosters") or 12)
+_index, _matchups, _repl_levels = load_analytics(scoring_key(scoring), num_teams, tuple(roster_positions))
 
-_repl_levels = _replacement_levels()
+roster = enrich_with_ids(current_data.get("roster", []), _players_db, _name_index)
+waivers = enrich_with_ids(current_data.get("waivers", []), _players_db, _name_index)
+playoff_weeks = playoff_weeks_for(current_data.get("playoff_week_start"))
+
+_season_year = _index.season
+_current_season = current_nfl_season()
+status_bits = [f"Stats: {_season_year} regular season through week {_index.last_week}",
+               f"Scoring: {scoring_label(scoring)}"]
+if _schedules_df.empty:
+    status_bits.append("Schedule unavailable")
+db_age = players_db_age_seconds()
+if db_age is not None:
+    status_bits.append(f"Injuries as of {db_age / 3600:.0f}h ago")
+st.caption(" · ".join(status_bits))
+if _season_year and _season_year < _current_season:
+    st.info(f"No {_current_season} stats yet — values use the {_season_year} season. "
+            f"Matchups use the {_current_season} schedule with {_season_year} defensive data.")
+if not _players_db:
+    st.warning("Sleeper player database unavailable — injury statuses and player lookups are disabled.")
+
+# Sync freshness / season warnings
+if current_data:
+    synced_at = current_data.get("synced_at")
+    if synced_at:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(synced_at)
+        days = age.total_seconds() / 86400
+        age_str = f"{days:.0f} days ago" if days >= 1 else f"{age.total_seconds() / 3600:.0f}h ago"
+        st.sidebar.caption(f"Last synced {age_str}")
+        if days > STALE_SYNC_DAYS:
+            st.sidebar.warning("Roster and waiver pool may be stale — re-sync to drop players already claimed.")
+    elif roster:
+        st.sidebar.warning("Sync time unknown (older file). Re-sync to refresh the roster and waiver pool.")
+    league_season = current_data.get("season")
+    if league_season and str(league_season).isdigit() and int(league_season) < _current_season:
+        st.sidebar.warning(f"This is the {league_season} league. Sleeper creates a new league ID each season — "
+                           "re-sync by league name to load the current one.")
+
+synced_budget = int(current_data.get("budget", 100))
+faab_enabled = current_data.get("faab_enabled", True)
+with st.sidebar.expander("💰 FAAB Budget", expanded=True):
+    if not faab_enabled:
+        st.caption("This league doesn't use FAAB — bids are shown for reference only.")
+    budget = st.number_input("Remaining Budget ($)", min_value=0, max_value=10000, value=synced_budget, step=1)
+    if budget != synced_budget and selected_league and st.button("Save Budget"):
+        save_league({**current_data, "budget": int(budget)}, selected_league)
+        st.rerun()
+
+
+# ── Per-player helpers ────────────────────────────────────────────────────────
+
+def stats_for(p) -> dict:
+    return _index.get_player_stats(p)
+
+def inj_for(p) -> str | None:
+    return injury_status(p, _injury_map)
+
+def matchup_for(p) -> tuple[dict | None, dict]:
+    next_g = _next_games.get(p.get("team", "")) if p.get("team") else None
+    if not next_g:
+        return None, dict(EMPTY_MATCHUP)
+    return next_g, get_matchup_info(next_g["opponent"], p.get("position", ""), _matchups)
+
+def stats_note(p, s) -> str:
+    if s["found"]:
+        return ""
+    return "n/a (team D)" if p.get("position") == "DEF" else "⚠️ not found"
+
+def player_context(p, s=None) -> dict:
+    """Facts handed to the AI so it doesn't rely on stale training data."""
+    s = s or stats_for(p)
+    next_g, m = matchup_for(p)
+    usage = _index.get_usage_trends(p)
+    ctx = {
+        "Position": p.get("position"), "Team": p.get("team"),
+        "Injury status": inj_for(p) or "None reported",
+        "Stats found": "yes" if s["found"] else "NO — no stats this season",
+        "Next game": (f"Week {next_g['week']} {'vs' if next_g['is_home'] else '@'} {next_g['opponent']} "
+                      f"(defense rank {m['rank'] or '?'}, {m['rank_label']} vs {p.get('position')})") if next_g else "None scheduled",
+        "Team implied total (Vegas)": _vegas_totals.get(p.get("team")),
+    }
+    for key, label in (("target_share", "Target share"), ("wopr", "WOPR")):
+        if key in usage:
+            ctx[f"{label} (recent / season)"] = f"{usage[key]['recent_avg']:.1%} / {usage[key]['season_avg']:.1%}"
+    if "recent_carries_pg" in usage:
+        ctx["Recent carries per game"] = usage["recent_carries_pg"]
+    return ctx
+
+
+roster_by_name = {p["name"]: p for p in roster}
+roster_stats = {p["name"]: stats_for(p) for p in roster}
 
 
 # ── UI Helpers ────────────────────────────────────────────────────────────────
@@ -149,15 +259,18 @@ def _verdict_color(v: str) -> str:
     return {"STRONG ADD": "green", "ADD": "green", "STREAM": "orange", "AVOID": "red",
             "ACCEPT": "green", "NEGOTIATE": "orange", "DECLINE": "red"}.get(v, "gray")
 
+def _grade_color(grade: str) -> str:
+    return {"A": "green", "B": "blue", "C": "orange", "D": "red", "F": "red"}.get(grade, "gray")
+
 def _score_gauge(score: float, label: str = "Value Score"):
     fig = go.Figure(go.Indicator(
         mode="gauge+number", value=score,
         title={"text": label},
         gauge={"axis": {"range": [0, 100]}, "bar": {"color": "steelblue"},
                "steps": [{"range": [0, 40], "color": "firebrick"},
-                          {"range": [40, 55], "color": "orange"},
-                          {"range": [55, 72], "color": "yellowgreen"},
-                          {"range": [72, 100], "color": "seagreen"}]},
+                         {"range": [40, 55], "color": "orange"},
+                         {"range": [55, 72], "color": "yellowgreen"},
+                         {"range": [72, 100], "color": "seagreen"}]},
     ))
     fig.update_layout(height=220, margin=dict(t=40, b=0, l=20, r=20))
     return fig
@@ -166,54 +279,38 @@ _RAIN_COLORS = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA"]
 
 def _raincloud_fig(names_samples: dict, title: str = "") -> go.Figure:
     """
-    Raincloud plot: half-violin + embedded box + jittered points.
-    2 players → mirrored butterfly violin.
-    3-4 players → grouped violins.
-    names_samples: {player_name: np.ndarray of MC samples}
+    Half-violin + box + jittered points. 2 series → mirrored butterfly; 3-4 → grouped.
+    names_samples: {label: np.ndarray of MC samples}
     """
-    names = list(names_samples.keys())
     rng = np.random.default_rng(42)
     fig = go.Figure()
-
-    if len(names) == 2:
-        for i, (name, samples) in enumerate(names_samples.items()):
-            pts = rng.choice(samples, size=min(300, len(samples)), replace=False)
-            color = _RAIN_COLORS[i]
+    mirrored = len(names_samples) == 2
+    for i, (name, samples) in enumerate(names_samples.items()):
+        samples = np.asarray(samples, dtype=float)
+        pts = rng.choice(samples, size=min(300, len(samples)), replace=False)
+        color = _RAIN_COLORS[i % len(_RAIN_COLORS)]
+        kwargs = dict(y=pts, name=name, fillcolor=color, line_color=color, opacity=0.65,
+                      box_visible=True, meanline_visible=True, points="all",
+                      marker=dict(color=color, size=2.5, opacity=0.35), spanmode="hard")
+        if mirrored:
             side = "negative" if i == 0 else "positive"
-            pointpos = 1.6 if side == "negative" else -1.6
-            fig.add_trace(go.Violin(
-                y=pts, name=name, side=side,
-                fillcolor=color, line_color=color, opacity=0.65,
-                box_visible=True, meanline_visible=True,
-                points="all", jitter=0.05, pointpos=pointpos,
-                marker=dict(color=color, size=2.5, opacity=0.35),
-                spanmode="hard",
-            ))
-        fig.update_layout(violinmode="overlay")
-    else:
-        for i, (name, samples) in enumerate(names_samples.items()):
-            pts = rng.choice(samples, size=min(300, len(samples)), replace=False)
-            color = _RAIN_COLORS[i % len(_RAIN_COLORS)]
-            fig.add_trace(go.Violin(
-                y=pts, x=[name] * len(pts), name=name,
-                fillcolor=color, line_color=color, opacity=0.65,
-                box_visible=True, meanline_visible=True,
-                points="all", jitter=0.3, pointpos=-0.6,
-                marker=dict(color=color, size=2.5, opacity=0.35),
-                spanmode="hard",
-            ))
-        fig.update_layout(violinmode="group")
-
-    fig.update_layout(
-        title=title,
-        yaxis_title="Simulated Fantasy Points",
-        height=400,
-        margin=dict(t=50, b=20, l=20, r=20),
-    )
+            kwargs.update(side=side, jitter=0.05, pointpos=1.6 if side == "negative" else -1.6)
+        else:
+            kwargs.update(x=[name] * len(pts), jitter=0.3, pointpos=-0.6)
+        fig.add_trace(go.Violin(**kwargs))
+    fig.update_layout(violinmode="overlay" if mirrored else "group", title=title,
+                      yaxis_title="Simulated Fantasy Points", height=400,
+                      margin=dict(t=50, b=20, l=20, r=20))
     return fig
 
-def _grade_color(grade: str) -> str:
-    return {"A": "green", "B": "blue", "C": "orange", "D": "red", "F": "red"}.get(grade, "gray")
+def _ai_block(state_key: str, request_id, button_label: str, run):
+    """AI button whose output survives reruns (keyed to the current request)."""
+    if st.button(button_label, key=f"{state_key}_btn"):
+        with st.spinner(f"Analyzing with {st.session_state.ai_provider}..."):
+            st.session_state[state_key] = (request_id, run())
+    stored = st.session_state.get(state_key)
+    if stored and stored[0] == request_id:
+        st.markdown(stored[1])
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -231,45 +328,29 @@ with tab_roster:
     if not roster:
         st.info("Sync a league from the sidebar.")
     else:
-        enriched = rank_available_players(roster, _weekly_df, scoring)
-
-        # Enrich with injury and upcoming matchup
         rows = []
-        for p in enriched:
-            name = p["name"]
-            pos = p.get("position", "")
-            team = p.get("team", "")
-
-            # Injury
-            inj = injury_badge(name, _injury_map)
-            inj_str = inj if inj else ""
-
-            # Next game opponent + defense rank
-            next_g = get_next_game(team, _schedules_df) if team else None
-            if next_g:
-                opp = next_g["opponent"]
-                m = get_matchup_info(opp, pos, _defense_df)
-                matchup_str = f"vs {opp} ({m['rank_label']})"
-            else:
-                matchup_str = "Offseason"
-
+        for p in roster:
+            s = roster_stats[p["name"]]
+            next_g, m = matchup_for(p)
             rows.append({
-                "Player": name, "Pos": pos,
-                "Season PPG": p.get("season_ppg", 0),
-                "Recent PPG": p.get("recent_ppg", 0),
-                "Injury": inj_str,
-                "Next Matchup": matchup_str,
+                "Player": p["name"], "Pos": p.get("position", ""), "Team": p.get("team", ""),
+                "Season PPG": s["season"]["ppg"], "Recent PPG": s["recent"]["ppg"],
+                "Games": s["season"]["games"],
+                "Injury": inj_for(p) or "",
+                "Next Matchup": f"vs {next_g['opponent']} ({m['rank_label']})" if next_g else "—",
+                "Stats": stats_note(p, s),
             })
-
         df_roster = pd.DataFrame(rows)
-        st.dataframe(df_roster, hide_index=True, use_container_width=True)
+        st.dataframe(df_roster, hide_index=True, width="stretch")
 
-        fig = px.bar(
-            df_roster.sort_values("Season PPG", ascending=False).head(12),
-            x="Player", y="Season PPG", color="Pos",
-            title=f"Season PPG — {_season_year}",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        missing = df_roster[df_roster["Stats"] == "⚠️ not found"]["Player"].tolist()
+        if missing:
+            st.caption(f"⚠️ No {_season_year} stats found for: {', '.join(missing)} "
+                       "(rookie, didn't play, or an unmatched name). Their values show as 0.")
+
+        fig = px.bar(df_roster.sort_values("Season PPG", ascending=False).head(12),
+                     x="Player", y="Season PPG", color="Pos", title=f"Season PPG — {_season_year}")
+        st.plotly_chart(fig, width="stretch")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -281,72 +362,61 @@ with tab_waivers:
     if not waivers:
         st.info("Sync a league to load the waiver pool.")
     else:
-        pos_opts = sorted({w["position"] for w in waivers} & {"QB", "RB", "WR", "TE", "K", "DEF"})
-        sel_pos = st.multiselect("Filter by Position", pos_opts, default=["RB", "WR", "TE"])
-        filtered = [w for w in waivers if w["position"] in sel_pos] if sel_pos else waivers
+        present = {w.get("position") for w in waivers}
+        pos_opts = [p for p in ["QB", "RB", "WR", "TE", "K", "DEF"] if p in present]
+        fc1, fc2 = st.columns([3, 1])
+        sel_pos = fc1.multiselect("Filter by Position", pos_opts,
+                                  default=[p for p in ["RB", "WR", "TE"] if p in pos_opts])
+        hide_inactive = fc2.checkbox("Hide Out / IR / Doubtful", value=True)
 
-        with st.spinner("Loading stats..."):
-            enriched = rank_available_players(filtered, _weekly_df, scoring)
+        filtered = [w for w in waivers if not sel_pos or w.get("position") in sel_pos]
+        if hide_inactive:
+            filtered = [w for w in filtered if not is_inactive(inj_for(w))]
+        enriched = _index.rank_available_players(filtered)
 
         sort_by = st.radio("Sort by", ["Trending", "Season PPG", "Recent PPG"], horizontal=True)
         sk = {"Trending": "trend_count", "Season PPG": "season_ppg", "Recent PPG": "recent_ppg"}[sort_by]
-        enriched_sorted = sorted(enriched, key=lambda x: x.get(sk, 0), reverse=True)
+        enriched_sorted = sorted(enriched, key=lambda x: x.get(sk) or 0, reverse=True)
 
-        # Build display table with injury + matchup
         table_rows = []
         for p in enriched_sorted:
-            name, pos, team = p["name"], p.get("position", ""), p.get("team", "")
-            inj = injury_badge(name, _injury_map)
-            next_g = get_next_game(team, _schedules_df) if team else None
-            opp_str, mult = "—", 1.0
-            if next_g:
-                opp = next_g["opponent"]
-                m = get_matchup_info(opp, pos, _defense_df)
-                opp_str = f"vs {opp} ({m['rank_label']})"
-                mult = m["multiplier"]
-            vegas_total = _vegas_totals.get(team, None)
+            next_g, m = matchup_for(p)
             table_rows.append({
-                "Name": name, "Pos": pos, "Team": team,
-                "Season PPG": p.get("season_ppg", 0),
-                "Recent PPG": p.get("recent_ppg", 0),
+                "Name": p["name"], "Pos": p.get("position", ""), "Team": p.get("team", ""),
+                "Season PPG": p["season_ppg"], "Recent PPG": p["recent_ppg"], "Games": p["games"],
                 "Trending": p.get("trend_count", 0),
-                "Next Matchup": opp_str,
-                "Injury": inj or "",
-                "Implied Total": vegas_total or "—",
+                "Next Matchup": f"vs {next_g['opponent']} ({m['rank_label']})" if next_g else None,
+                "Injury": inj_for(p) or "",
+                "Implied Total": _vegas_totals.get(p.get("team")),
             })
-
-        df_w = pd.DataFrame(table_rows)
-        st.dataframe(df_w, hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
 
         st.divider()
         st.subheader("Player Deep Dive")
-        waiver_names = [p["name"] for p in enriched_sorted]
-        selected_waiver = st.selectbox("Select player", waiver_names)
 
-        if selected_waiver:
-            p_data = next((p for p in enriched_sorted if p["name"] == selected_waiver), {})
-            pos = p_data.get("position", "WR")
+        if not enriched_sorted:
+            st.caption("No players match the current filters.")
+        else:
+            sel_i = st.selectbox("Select player", range(len(enriched_sorted)),
+                                 format_func=lambda i: player_label(enriched_sorted[i]))
+            p_data = enriched_sorted[sel_i]
+            selected_waiver = p_data["name"]
+            pos = p_data.get("position", "")
             team = p_data.get("team", "")
-            player_stats = get_player_stats(selected_waiver, _weekly_df, scoring)
+            player_stats = stats_for(p_data)
+            next_g, def_info = matchup_for(p_data)
 
-            # Defense matchup for this player's next game
-            next_g = get_next_game(team, _schedules_df) if team else None
-            def_info = {"multiplier": 1.0, "rank_label": "Unknown", "pts_allowed": None}
-            opp_team = None
-            if next_g:
-                opp_team = next_g["opponent"]
-                def_info = get_matchup_info(opp_team, pos, _defense_df)
+            if not player_stats["found"]:
+                st.warning(f"No {_season_year} stats found for {selected_waiver} — the score below "
+                           "reflects no production, not a confirmed bad player.")
 
-            ws = score_waiver(
-                player_stats, pos, p_data.get("trend_count", 0),
-                defense_multiplier=def_info["multiplier"],
-                replacement_levels=_repl_levels,
-            )
+            ws = score_waiver(player_stats, pos, p_data.get("trend_count", 0),
+                              defense_multiplier=def_info["multiplier"], replacement_levels=_repl_levels)
+            drop = recommend_drop(pos, roster, roster_stats, _repl_levels) if roster else None
 
-            # ── Row 1: gauge + core metrics ──
             col_g, col_m = st.columns([1, 2])
             with col_g:
-                st.plotly_chart(_score_gauge(ws["score"]), use_container_width=True)
+                st.plotly_chart(_score_gauge(ws["score"]), width="stretch")
             with col_m:
                 v = ws["verdict"]
                 st.markdown(f"### :{_verdict_color(v)}[{v}]")
@@ -354,54 +424,45 @@ with tab_waivers:
                 m1.metric("Expected Pts/Wk", ws["expected_pts"])
                 m2.metric("Consistency", f"{ws['consistency_pct']:.0f}%")
                 m3.metric("vs Replacement", f"{ws['surplus_vs_replacement']:+.1f}")
-                if def_info["pts_allowed"]:
-                    delta = f"{'above' if def_info['multiplier'] > 1 else 'below'} avg"
-                    m4.metric("Matchup Adj", f"×{def_info['multiplier']:.2f}", delta)
+                if def_info["pts_allowed"] is not None:
+                    m4.metric("Matchup Adj", f"×{def_info['multiplier']:.2f}",
+                              f"{'above' if def_info['multiplier'] > 1 else 'below'} avg")
 
-                budget_slider = st.slider("FAAB Budget", 0, max(budget * 2, 200), int(budget))
-                bid_amount = round(ws["faab_bid_pct"] * budget_slider)
+                bid_amount = round(ws["faab_bid_pct"] * budget)
                 st.metric("Recommended FAAB Bid", f"${bid_amount}",
-                          help=f"{ws['faab_bid_pct']*100:.0f}% of budget")
+                          help=f"{ws['faab_bid_pct'] * 100:.0f}% of your ${budget} remaining budget")
 
-                if roster:
-                    roster_stats_drop = {p["name"]: get_player_stats(p["name"], _weekly_df, scoring) for p in roster}
-                    drop = recommend_drop(pos, roster, roster_stats_drop, _repl_levels)
-                    if drop:
-                        drop_color = "red" if drop["surplus"] < 0 else "orange"
-                        st.markdown(
-                            f"**✂️ Drop:** :{drop_color}[{drop['name']}]"
-                            f" ({drop['position']} · {drop['adj_value']} adj pts) — {drop['reason']}"
-                        )
+                if drop:
+                    drop_color = "red" if drop["surplus"] < 0 else "orange"
+                    st.markdown(f"**✂️ Drop:** :{drop_color}[{drop['name']}]"
+                                f" ({drop['position']} · {drop['adj_value']} adj pts) — {drop['reason']}")
 
-            # ── Row 2: Context panels ──
             ctx1, ctx2, ctx3 = st.columns(3)
-
             with ctx1:
                 st.markdown("**🛡️ Matchup**")
                 if next_g:
                     hw = "🏠 Home" if next_g["is_home"] else "✈️ Away"
-                    st.write(f"Week {next_g['week']} {hw} vs **{opp_team}**")
-                    st.write(f"Rank: {def_info.get('rank', '—')} | {def_info['rank_label']}")
-                    st.write(f"Avg allowed vs {pos}: {def_info.get('pts_allowed', '—')} pts/gm")
-                    # Weather
-                    wx = get_weather_for_game(next_g)
-                    if wx:
-                        if wx.get("dome"):
-                            st.write("🏟️ Indoor — no weather")
-                        else:
-                            st.write(f"🌡️ {wx.get('temp_f', '?')}°F | 💨 {wx.get('wind_mph', '?')} mph")
-                            for flag in wx.get("flags", []):
-                                st.warning(flag)
+                    st.write(f"Week {next_g['week']} {hw} vs **{next_g['opponent']}**")
+                    st.write(f"Rank: {def_info.get('rank') or '—'} | {def_info['rank_label']}")
+                    st.write(f"Avg allowed vs {pos}: {def_info.get('pts_allowed') or '—'} pts/gm")
+                    wx = cached_weather(next_g["home_team"], next_g["gameday"])
+                    if wx and wx.get("dome"):
+                        st.write("🏟️ Indoor — no weather")
+                    elif wx:
+                        st.write(f"🌡️ {wx.get('temp_f', '?')}°F | 💨 {wx.get('wind_mph', '?')} mph")
+                        for flag in wx.get("flags", []):
+                            st.warning(flag)
+                    else:
+                        st.caption("Forecast not available yet")
                 else:
-                    st.write("No upcoming game (offseason)")
+                    st.write("No upcoming game")
 
             with ctx2:
                 st.markdown("**📈 Usage Trends**")
-                usage = get_usage_trends(selected_waiver, _weekly_df)
+                usage = _index.get_usage_trends(p_data)
                 if usage:
                     for metric, label in [("target_share", "Target Share"),
-                                           ("air_yards_share", "Air Yards Share"),
-                                           ("wopr", "WOPR")]:
+                                          ("air_yards_share", "Air Yards Share"), ("wopr", "WOPR")]:
                         if metric in usage:
                             u = usage[metric]
                             arrow = "↑" if u["trend"] > 0.01 else ("↓" if u["trend"] < -0.01 else "→")
@@ -414,31 +475,27 @@ with tab_waivers:
             with ctx3:
                 st.markdown("**🎰 Vegas & Injury**")
                 vt = _vegas_totals.get(team)
-                if vt:
+                if vt is not None:
                     st.metric("Team Implied Total", vt)
                 else:
-                    st.write("Vegas: offseason / no key")
-                inj = injury_badge(selected_waiver, _injury_map)
+                    st.write("Vegas: no line (offseason or no ODDS_API_KEY)")
+                inj = inj_for(p_data)
                 if inj:
                     st.error(f"🏥 {inj}")
                 else:
-                    st.success("✅ Healthy")
+                    st.success("✅ No injury designation")
 
-            # ── Weekly sparkline ──
             weekly_pts = player_stats.get("weekly", [])
             if weekly_pts:
-                fig = px.line(
-                    x=list(range(1, len(weekly_pts) + 1)), y=weekly_pts,
-                    labels={"x": "Week", "y": "Fantasy Points"},
-                    title=f"{selected_waiver} — Weekly Scoring",
-                )
+                fig = px.line(x=player_stats["weeks"], y=weekly_pts, markers=True,
+                              labels={"x": "Week", "y": "Fantasy Points"},
+                              title=f"{selected_waiver} — Weekly Scoring")
                 fig.add_hline(y=ws["expected_pts"], line_dash="dash", line_color="steelblue",
                               annotation_text="Expected")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
-            # ── Monte Carlo ──
             with st.expander("🎲 Monte Carlo Simulation"):
-                waiver_samples = simulate_player(player_stats)
+                waiver_samples = simulate_player(player_stats, selected_waiver)
                 smry = _summary(waiver_samples)
                 mc1, mc2, mc3, mc4 = st.columns(4)
                 mc1.metric("Floor (10th pct)", smry["floor"])
@@ -446,27 +503,21 @@ with tab_waivers:
                 mc3.metric("Ceiling (90th pct)", smry["ceiling"])
                 mc4.metric("Std Dev", smry["std"])
 
-                # Build raincloud — add drop candidate for comparison if available
                 rc_map = {selected_waiver: waiver_samples}
-                if roster:
-                    roster_stats_drop = {p["name"]: get_player_stats(p["name"], _weekly_df, scoring) for p in roster}
-                    drop_cand = recommend_drop(pos, roster, roster_stats_drop, _repl_levels)
-                    if drop_cand:
-                        drop_stats = get_player_stats(drop_cand["name"], _weekly_df, scoring)
-                        rc_map[f"Drop: {drop_cand['name']}"] = simulate_player(drop_stats)
-
-                st.plotly_chart(
-                    _raincloud_fig(rc_map, "Simulated Outcome Distributions (10,000 games)"),
-                    use_container_width=True,
-                )
+                if drop:
+                    rc_map[f"Drop: {drop['name']}"] = simulate_player(roster_stats[drop["name"]], drop["name"])
+                st.plotly_chart(_raincloud_fig(rc_map, "Simulated Outcome Distributions (10,000 games)"),
+                                width="stretch")
 
             with st.expander("🤖 AI Narrative Analysis (optional)"):
-                st.caption("Add `ANTHROPIC_API_KEY` or `GOOGLE_API_KEY` to .env to enable.")
-                if st.button("Get AI Analysis", key="waiver_ai"):
-                    with st.spinner(f"Analyzing with {st.session_state.ai_provider}..."):
-                        agent = FantasyAgent(provider=st.session_state.ai_provider)
-                        analysis = agent.analyze_waiver(selected_waiver, player_stats, roster, scoring, budget)
-                    st.markdown(analysis)
+                st.caption("Needs `ANTHROPIC_API_KEY` or `GOOGLE_API_KEY` in .env.")
+                ctx = player_context(p_data, player_stats)
+                ctx.update({"Model score": f"{ws['score']} ({ws['verdict']})",
+                            "Model FAAB bid": f"${bid_amount}"})
+                _ai_block("ai_waiver", (selected_league, p_data.get("player_id") or selected_waiver),
+                          "Get AI Analysis",
+                          lambda: FantasyAgent(st.session_state.ai_provider).analyze_waiver(
+                              selected_waiver, player_stats, roster, scoring, budget, ctx))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -478,111 +529,102 @@ with tab_start_sit:
     if not roster:
         st.info("Sync a league to compare roster players.")
     else:
-        roster_names = [p["name"] for p in roster]
-        selected_players = st.multiselect(
-            "Select 2–4 players to compare", roster_names, max_selections=4,
-        )
+        selected_players = st.multiselect("Select 2–4 players to compare", list(roster_by_name), max_selections=4)
+        if st.button("⚖️ Compare"):
+            st.session_state.ss_request = tuple(selected_players)
 
         if len(selected_players) < 2:
             st.caption("Select at least 2 players.")
-        elif st.button("⚖️ Compare"):
-            with st.spinner("Fetching stats..."):
-                named_stats = {n: get_player_stats(n, _weekly_df, scoring) for n in selected_players}
+        elif st.session_state.get("ss_request") != tuple(selected_players):
+            st.caption("Click **Compare** to run the analysis.")
+        else:
+            named_stats = {n: roster_stats[n] for n in selected_players}
+            adjustments, multipliers, matchups = {}, {}, {}
+            for n in selected_players:
+                p_obj = roster_by_name[n]
+                next_g, m = matchup_for(p_obj)
+                inj = inj_for(p_obj)
+                adjustments[n] = {"matchup": m["multiplier"], "injury": inj}
+                multipliers[n] = m["multiplier"] * injury_factor(inj)
+                matchups[n] = (next_g, m)
 
-            ranked = rank_players(named_stats)
-            mc_result = simulate_multi_start(named_stats)
+            ranked = rank_players(named_stats, adjustments)
+            mc_result = simulate_multi_start(named_stats, multipliers)
             top = ranked[0]
             conf_label = top.get("confidence_label", "")
-            conf_pct = top.get("confidence_pct", 0)
-
             banner_color = "green" if conf_label == "Clear" else ("orange" if conf_label == "Lean" else "gray")
             mc_pct = round(mc_result["win_probs"].get(top["name"], 0) * 100)
-            st.markdown(
-                f"## :{banner_color}[START: {top['name']}]  "
-                f"— {conf_label} · Adj value edge {top.get('margin_to_next', 0):.1f} pts · "
-                f"MC win prob {mc_pct}%"
-            )
+            st.markdown(f"## :{banner_color}[START: {top['name']}]  "
+                        f"— {conf_label} · Projected edge {top.get('margin_to_next', 0):.1f} pts · "
+                        f"MC win prob {mc_pct}%")
+            st.caption("Projection = adjusted value × opponent defense multiplier × injury factor "
+                       "(Questionable ×0.85, Doubtful ×0.25, Out/IR ×0).")
 
-            # Player cards
+            missing = [n for n in selected_players if not named_stats[n]["found"]]
+            if missing:
+                st.warning(f"No {_season_year} stats for: {', '.join(missing)} — comparison is unreliable.")
+
             cols = st.columns(len(ranked))
             for col, r in zip(cols, ranked):
                 name = r["name"]
                 is_start = r["rank"] == 1
-                lbl_color = "green" if is_start else "red"
                 mc_smry = mc_result["summaries"][name]
-                win_p = round(mc_result["win_probs"][name] * 100)
-
-                # Matchup
-                p_obj = next((p for p in roster if p["name"] == name), {})
-                team = p_obj.get("team", "")
-                next_g = get_next_game(team, _schedules_df) if team else None
-                opp_str = f"vs {next_g['opponent']}" if next_g else "Offseason"
-                def_i = get_matchup_info(next_g["opponent"], p_obj.get("position", ""), _defense_df) if next_g else {}
-
+                next_g, m = matchups[name]
                 with col:
-                    lbl = "✅ START" if is_start else f"#{r['rank']} BENCH"
                     st.markdown(f"**{name}**")
-                    st.markdown(f":{lbl_color}[{lbl}]")
-                    st.metric("Adj Value", r["adj_value"])
-                    st.metric("Consistency", f"{r['consistency']*100:.0f}%")
-                    st.metric("MC Win Prob", f"{win_p}%")
+                    start_lbl = "✅ START" if is_start else f"#{r['rank']} BENCH"
+                    st.markdown(f":{'green' if is_start else 'red'}[{start_lbl}]")
+                    st.metric("Projected", r["start_value"], help=f"Base adj value {r['adj_value']}")
+                    st.metric("Consistency", f"{r['consistency'] * 100:.0f}%")
+                    st.metric("MC Win Prob", f"{round(mc_result['win_probs'][name] * 100)}%")
                     st.metric("Floor / Ceiling", f"{mc_smry['floor']} / {mc_smry['ceiling']}")
-                    st.caption(f"{opp_str} — {def_i.get('rank_label', '')}")
-                    inj = injury_badge(name, _injury_map)
-                    if inj:
-                        st.error(f"🏥 {inj}")
+                    if next_g:
+                        st.caption(f"vs {next_g['opponent']} — {m['rank_label']} (×{m['multiplier']:.2f})")
+                    else:
+                        st.caption("No upcoming game")
+                    if r["injury"]:
+                        st.error(f"🏥 {r['injury']}")
 
-            # Comparison bar chart
             rows = []
             for name, stats in named_stats.items():
-                s = stats.get("season") or {}
-                rc = stats.get("recent") or {}
                 v = next(r for r in ranked if r["name"] == name)
                 rows += [
-                    {"Player": name, "Metric": "Season PPG", "Value": s.get("ppg", 0)},
-                    {"Player": name, "Metric": "Recent PPG", "Value": rc.get("ppg", 0)},
-                    {"Player": name, "Metric": "Adj Value", "Value": v["adj_value"]},
+                    {"Player": name, "Metric": "Season PPG", "Value": stats["season"]["ppg"]},
+                    {"Player": name, "Metric": "Recent PPG", "Value": stats["recent"]["ppg"] or 0},
+                    {"Player": name, "Metric": "Projected", "Value": v["start_value"]},
                 ]
-            fig = px.bar(pd.DataFrame(rows), x="Metric", y="Value", color="Player",
-                         barmode="group", title="Head-to-Head Comparison",
-                         category_orders={"Metric": ["Season PPG", "Recent PPG", "Adj Value"]})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(px.bar(pd.DataFrame(rows), x="Metric", y="Value", color="Player", barmode="group",
+                                   title="Head-to-Head Comparison",
+                                   category_orders={"Metric": ["Season PPG", "Recent PPG", "Projected"]}),
+                            width="stretch")
 
-            # Raincloud — MC outcome distributions
-            rc_samples = {n: simulate_player(named_stats[n]) for n in selected_players}
-            st.plotly_chart(
-                _raincloud_fig(rc_samples, "Simulated Outcome Distributions (10,000 games)"),
-                use_container_width=True,
-            )
+            st.plotly_chart(_raincloud_fig(mc_result["samples"], "Simulated Outcome Distributions (10,000 games)"),
+                            width="stretch")
 
             if len(selected_players) == 2:
-                p1, p2 = selected_players[0], selected_players[1]
-                hth = simulate_start_sit(p1, named_stats[p1], p2, named_stats[p2])
+                p1, p2 = selected_players
+                hth = simulate_start_sit(p1, named_stats[p1], p2, named_stats[p2], multipliers)
                 hc1, hc2 = st.columns(2)
-                hc1.metric(f"P({p1} wins)", f"{hth['p1_win_prob']*100:.0f}%")
-                hc2.metric(f"P({p2} wins)", f"{hth['p2_win_prob']*100:.0f}%")
+                hc1.metric(f"P({p1} outscores)", f"{hth['p1_win_prob'] * 100:.0f}%")
+                hc2.metric(f"P({p2} outscores)", f"{hth['p2_win_prob'] * 100:.0f}%")
 
             with st.expander("Weekly scoring history"):
                 fig2 = go.Figure()
                 for name, stats in named_stats.items():
-                    wp = stats.get("weekly", [])
-                    if wp:
-                        fig2.add_trace(go.Scatter(x=list(range(1, len(wp)+1)), y=wp,
-                                                   mode="lines+markers", name=name))
-                fig2.update_layout(xaxis_title="Week", yaxis_title="Fantasy Points",
-                                   title="Season Weekly Scores")
-                st.plotly_chart(fig2, use_container_width=True)
+                    if stats["weekly"]:
+                        fig2.add_trace(go.Scatter(x=stats["weeks"], y=stats["weekly"], mode="lines+markers", name=name))
+                fig2.update_layout(xaxis_title="Week", yaxis_title="Fantasy Points", title="Season Weekly Scores")
+                st.plotly_chart(fig2, width="stretch")
 
             with st.expander("🤖 AI Narrative Analysis (optional — 2 players only)"):
-                st.caption("Add API key to .env to enable.")
-                if len(selected_players) == 2 and st.button("Get AI Analysis", key="ss_ai"):
-                    p1, p2 = selected_players[0], selected_players[1]
-                    with st.spinner("Getting AI take..."):
-                        agent = FantasyAgent(provider=st.session_state.ai_provider)
-                        rec = agent.analyze_start_sit(p1, p2, named_stats[p1], named_stats[p2], scoring)
-                    st.markdown(rec)
-                elif len(selected_players) > 2:
-                    st.caption("AI narrative only available for 2-player comparisons.")
+                if len(selected_players) == 2:
+                    p1, p2 = selected_players
+                    contexts = {n: player_context(roster_by_name[n], named_stats[n]) for n in (p1, p2)}
+                    _ai_block("ai_ss", (selected_league, p1, p2), "Get AI Analysis",
+                              lambda: FantasyAgent(st.session_state.ai_provider).analyze_start_sit(
+                                  p1, p2, named_stats[p1], named_stats[p2], scoring, contexts))
+                else:
+                    st.caption("AI narrative is only available for 2-player comparisons.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -590,104 +632,102 @@ with tab_start_sit:
 # ════════════════════════════════════════════════════════════════════════════
 with tab_trade:
     st.subheader("Trade Analyzer")
-    roster_names = [p["name"] for p in roster] if roster else []
 
-    giving = st.multiselect("You Give (from your roster)", roster_names)
-    receiving_text = st.text_area("You Receive (one name per line)")
-    receiving = [n.strip() for n in receiving_text.splitlines() if n.strip()]
+    roster_ids = {p.get("player_id") for p in roster if p.get("player_id")}
+    trade_pool = {p["player_id"]: p for p in _trade_pool if p["player_id"] not in roster_ids}
 
-    if st.button("🤝 Analyze Trade") and (giving or receiving):
-        all_names = giving + receiving
-        with st.spinner("Looking up stats..."):
-            stats_map = {n: get_player_stats(n, _weekly_df, scoring) for n in all_names}
+    giving = st.multiselect("You Give (from your roster)", list(roster_by_name))
+    recv_ids = st.multiselect("You Receive", list(trade_pool),
+                              format_func=lambda pid: player_label(trade_pool[pid]),
+                              placeholder="Search any NFL player…")
+    receiving_players = [trade_pool[pid] for pid in recv_ids]
+    receiving = [p["name"] for p in receiving_players]
 
-        giving_stats = {n: stats_map[n] for n in giving}
-        receiving_stats = {n: stats_map[n] for n in receiving}
+    request = (selected_league, tuple(giving), tuple(p["player_id"] for p in receiving_players))
+    if st.button("🤝 Analyze Trade", disabled=not (giving or receiving)):
+        st.session_state.trade_request = request
 
-        det_result = score_trade(giving_stats, receiving_stats)
-        mc_result = simulate_trade(giving_stats, receiving_stats)
+    if (giving or receiving) and st.session_state.get("trade_request") == request:
+        give_players = [roster_by_name[n] for n in giving]
+        stats_map = {p["name"]: (roster_stats.get(p["name"]) or stats_for(p)) for p in give_players + receiving_players}
+        all_stats = {**roster_stats, **stats_map}
 
-        # Use MC verdict as primary (more nuanced)
-        verdict = mc_result["verdict"]
-        color = _verdict_color(verdict)
-        ratio_pct = round((det_result["ratio"] - 1) * 100, 1)
-        sign = "+" if ratio_pct >= 0 else ""
-        mc_pct = round(mc_result["p_receive_better"] * 100)
+        missing = [n for n, s in stats_map.items() if not s["found"]]
+        if missing:
+            st.warning(f"No {_season_year} stats for: {', '.join(missing)} — valued at 0.")
 
-        st.markdown(
-            f"## :{color}[{verdict}]  "
-            f"— Adj value {sign}{ratio_pct}% · P(receive wins) = {mc_pct}%"
-        )
+        trade = score_trade(roster, giving, receiving_players, all_stats, _repl_levels, roster_positions)
+        if trade["method"] == "lineup":
+            mc = simulate_lineup_change([s["name"] for s in trade["before"]["starters"]],
+                                        [s["name"] for s in trade["after"]["starters"]], all_stats)
+            p_better = mc["p_better"]
+            rc = {"Lineup Before": mc["before_samples"], "Lineup After": mc["after_samples"]}
+            rc_title = "Weekly Starting-Lineup Total (10,000 simulations)"
+            headline = (f"Starting lineup {trade['delta']:+.1f} pts/wk ({trade['delta_pct'] * 100:+.1f}%) · "
+                        f"P(better week) = {round(p_better * 100)}%")
+        else:
+            mc = simulate_trade({n: stats_map[n] for n in giving}, {n: stats_map[n] for n in receiving})
+            p_better = mc["p_receive_better"]
+            rc = {"You Give": mc["give_samples"], "You Receive": mc["receive_samples"]}
+            rc_title = "Total Weekly Output (10,000 simulations)"
+            headline = f"Value over replacement {trade['delta']:+.1f} pts/wk · P(receive side wins) = {round(p_better * 100)}%"
 
-        # Value + MC columns
+        verdict = trade["verdict"]
+        st.markdown(f"## :{_verdict_color(verdict)}[{verdict}]  — {headline}")
+        st.caption("Verdict is based on your best possible starting lineup before vs. after the trade, so "
+                   "bench depth only counts if it would start. Value over replacement (VORP) is shown per player.")
+
         vc1, vc2 = st.columns(2)
-        with vc1:
-            st.markdown("**You Give**")
-            for name, val in det_result["you_give"].items():
-                inj = injury_badge(name, _injury_map)
-                inj_str = f" 🏥 {inj}" if inj else ""
-                st.metric(f"{name}{inj_str}", f"{val} adj pts/wk")
-            st.metric("Total", f"{det_result['give_total']} pts/wk")
-            g = mc_result["give"]
-            st.caption(f"MC: Median {g['median']} | Floor {g['floor']} | Ceiling {g['ceiling']}")
+        for col, side, header, total in [(vc1, trade["you_give"], "You Give", trade["give_vorp"]),
+                                         (vc2, trade["you_receive"], "You Receive", trade["recv_vorp"])]:
+            with col:
+                st.markdown(f"**{header}**")
+                for name, val in side.items():
+                    inj = inj_for(roster_by_name.get(name) or next(p for p in receiving_players if p["name"] == name))
+                    st.metric(f"{name}{f' 🏥 {inj}' if inj else ''}", f"{val['adj_value']} adj pts/wk",
+                              f"VORP {val['surplus']:+.1f}", delta_color="off")
+                st.metric("Total VORP", f"{total} pts/wk")
 
-        with vc2:
-            st.markdown("**You Receive**")
-            for name, val in det_result["you_receive"].items():
-                inj = injury_badge(name, _injury_map)
-                inj_str = f" 🏥 {inj}" if inj else ""
-                st.metric(f"{name}{inj_str}", f"{val} adj pts/wk")
-            st.metric("Total", f"{det_result['recv_total']} pts/wk")
-            r = mc_result["receive"]
-            st.caption(f"MC: Median {r['median']} | Floor {r['floor']} | Ceiling {r['ceiling']}")
+        if trade["method"] == "lineup":
+            with st.expander("Starting lineup before vs. after"):
+                lc1, lc2 = st.columns(2)
+                for col, key, title in [(lc1, "before", "Before"), (lc2, "after", "After")]:
+                    lineup = trade[key]
+                    col.markdown(f"**{title}** — {lineup['total']} adj pts/wk")
+                    col.dataframe(pd.DataFrame([{"Slot": s["slot"], "Player": s["name"] or "(empty)",
+                                                 "Value": s["value"]} for s in lineup["starters"]]),
+                                  hide_index=True, width="stretch")
 
-        # Bar chart — individual player values
-        rows = []
-        for name in giving:
-            rows.append({"Side": "Give", "Player": name, "Adj Value": det_result["you_give"].get(name, 0)})
-        for name in receiving:
-            rows.append({"Side": "Receive", "Player": name, "Adj Value": det_result["you_receive"].get(name, 0)})
-        if rows:
-            fig = px.bar(pd.DataFrame(rows), x="Player", y="Adj Value", color="Side",
-                         color_discrete_map={"Give": "firebrick", "Receive": "seagreen"},
-                         title="Trade Value Comparison")
-            st.plotly_chart(fig, use_container_width=True)
+        bar_rows = ([{"Side": "Give", "Player": n, "Adj Value": v["adj_value"]} for n, v in trade["you_give"].items()]
+                    + [{"Side": "Receive", "Player": n, "Adj Value": v["adj_value"]} for n, v in trade["you_receive"].items()])
+        if bar_rows:
+            st.plotly_chart(px.bar(pd.DataFrame(bar_rows), x="Player", y="Adj Value", color="Side",
+                                   color_discrete_map={"Give": "firebrick", "Receive": "seagreen"},
+                                   title="Trade Value Comparison"), width="stretch")
 
-        # Raincloud — total projected output distributions for each side
-        give_total_samples = sum(simulate_player(s) for s in giving_stats.values())
-        recv_total_samples = sum(simulate_player(s) for s in receiving_stats.values())
-        trade_rc = {"You Give": give_total_samples, "You Receive": recv_total_samples}
-        st.plotly_chart(
-            _raincloud_fig(trade_rc, "Total Weekly Output Distributions (10,000 simulations)"),
-            use_container_width=True,
-        )
+        st.plotly_chart(_raincloud_fig(rc, rc_title), width="stretch")
 
-        # Playoff schedule strength for each player
-        all_pos_map = {p["name"]: p.get("position", "") for p in roster}
-        all_team_map = {p["name"]: p.get("team", "") for p in roster}
-
-        with st.expander("📅 Playoff Schedule Strength (Weeks 14–16)"):
+        wk_str = "–".join(str(w) for w in (playoff_weeks[0], playoff_weeks[-1]))
+        with st.expander(f"📅 Playoff Schedule Strength (Weeks {wk_str})"):
             psc1, psc2 = st.columns(2)
-            for col, side_names, header in [(psc1, giving, "You Give"), (psc2, receiving, "You Receive")]:
+            for col, players, header in [(psc1, give_players, "You Give"), (psc2, receiving_players, "You Receive")]:
                 with col:
                     st.markdown(f"**{header}**")
-                    for name in side_names:
-                        team = all_team_map.get(name, "")
-                        pos = all_pos_map.get(name, "WR")
-                        pss = get_playoff_schedule_strength(team, _schedules_df, _defense_df, pos)
-                        grade = pss["grade"]
-                        gc = _grade_color(grade)
-                        st.markdown(f"{name}: :{gc}[Grade {grade}] (avg mult {pss['avg_multiplier']:.2f})")
+                    for p in players:
+                        pss = get_playoff_schedule_strength(p.get("team", ""), _schedules_df, _matchups,
+                                                            p.get("position", ""), playoff_weeks)
+                        st.markdown(f"{p['name']}: :{_grade_color(pss['grade'])}[Grade {pss['grade']}] "
+                                    f"(avg mult {pss['avg_multiplier']:.2f})")
                         for wk in pss["weeks"]:
                             st.caption(f"  Wk {wk['week']}: vs {wk['opponent']} — {wk['matchup']}")
 
         with st.expander("🤖 AI Narrative Analysis (optional)"):
-            st.caption("Add API key to .env to enable.")
-            if st.button("Get AI Verdict", key="trade_ai"):
-                with st.spinner("Getting AI take..."):
-                    agent = FantasyAgent(provider=st.session_state.ai_provider)
-                    verdict_text = agent.analyze_trade(giving, receiving, stats_map, scoring)
-                st.markdown(verdict_text)
+            contexts = {p["name"]: player_context(p, stats_map[p["name"]]) for p in give_players + receiving_players}
+            summary = {"Verdict": verdict, "Lineup / value change": headline,
+                       "VORP given": trade["give_vorp"], "VORP received": trade["recv_vorp"]}
+            _ai_block("ai_trade", request, "Get AI Verdict",
+                      lambda: FantasyAgent(st.session_state.ai_provider).analyze_trade(
+                          giving, receiving, stats_map, scoring, contexts, summary))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -701,29 +741,23 @@ with tab_roster_mgmt:
     elif not waivers:
         st.info("Sync a league to load the waiver pool for recommendations.")
     else:
-        with st.spinner("Analyzing roster..."):
-            # Stats for all roster players
-            roster_stats = {p["name"]: get_player_stats(p["name"], _weekly_df, scoring) for p in roster}
-
-            # Stats for available players (limit to top 100 by trend + position for speed)
-            pos_filter = ["QB", "RB", "WR", "TE"]
-            avail_pool = [w for w in waivers if w.get("position") in pos_filter][:100]
-            avail_stats = {p["name"]: get_player_stats(p["name"], _weekly_df, scoring) for p in avail_pool}
-
-            analysis = analyze_roster_construction(
-                roster, avail_pool, roster_stats, avail_stats, _repl_levels
-            )
+        avail_pool = [w for w in waivers
+                      if w.get("position") in {"QB", "RB", "WR", "TE"} and not is_inactive(inj_for(w))]
+        avail_stats = {p["name"]: stats_for(p) for p in avail_pool}
+        avail_mults = {p["name"]: matchup_for(p)[1]["multiplier"] for p in avail_pool}
+        analysis = analyze_roster_construction(roster, avail_pool, roster_stats, avail_stats,
+                                               _repl_levels, avail_mults)
 
         pg = analysis["position_grades"]
         weaknesses = analysis["weaknesses"]
 
-        # Positional grade cards
         st.markdown("### Positional Strength")
         grade_cols = st.columns(len(pg))
         for col, (pos, g) in zip(grade_cols, pg.items()):
-            gc = _grade_color(g["grade"])
             col.metric(pos, f"Grade {g['grade']}", f"×{g['strength_ratio']:.2f} vs replacement")
             col.caption(f"{g['depth_count']} players · starters avg {g['avg_starter_val']:.1f} adj pts")
+        if "DEF" in pg:
+            st.caption("DEF grades use a fixed replacement level — team defense stats aren't in the nflverse data.")
 
         if weaknesses:
             st.warning(f"⚠️ Positional weaknesses: **{', '.join(weaknesses)}** — prioritized in recommendations below")
@@ -731,46 +765,29 @@ with tab_roster_mgmt:
             st.success("✅ No critical positional weaknesses")
 
         st.divider()
-
-        # Need-adjusted waiver targets
         st.markdown("### Need-Adjusted Waiver Targets")
-        st.caption("Score = base waiver score + need bonus (up to +20 for filling a weakness)")
+        st.caption("Score = waiver score (incl. next-game matchup) + need bonus (up to +20 for filling a weakness)")
 
         targets = analysis["targeted_adds"]
         if targets:
             target_rows = []
             for t in targets:
-                name = t["name"]
-                pos = t.get("position", "")
-                team = t.get("team", "")
-                next_g = get_next_game(team, _schedules_df) if team else None
-                opp_str = f"vs {next_g['opponent']}" if next_g else "—"
-                inj = injury_badge(name, _injury_map)
+                next_g, _ = matchup_for(t)
                 target_rows.append({
-                    "Player": name, "Pos": pos, "Team": team,
-                    "Need Score": t["need_adjusted_score"],
-                    "Base Score": t["base_score"],
+                    "Player": t["name"], "Pos": t.get("position", ""), "Team": t.get("team", ""),
+                    "Need Score": t["need_adjusted_score"], "Base Score": t["base_score"],
                     "Fills Need": "⭐ YES" if t["fills_need"] else "—",
-                    "Verdict": t["verdict"],
-                    "Adj Value": t["adj_value"],
-                    "Next Game": opp_str,
-                    "Injury": inj or "",
+                    "Verdict": t["verdict"], "Adj Value": t["adj_value"],
+                    "Next Game": f"vs {next_g['opponent']}" if next_g else None,
+                    "Injury": inj_for(t) or "",
                 })
+            df_targets = pd.DataFrame(target_rows).sort_values("Need Score", ascending=False)
+            st.dataframe(df_targets, hide_index=True, width="stretch")
 
-            df_targets = pd.DataFrame(target_rows)
-            st.dataframe(
-                df_targets.sort_values("Need Score", ascending=False),
-                hide_index=True, use_container_width=True,
-            )
-
-            # Bar chart: top 10 need-adjusted
-            top10 = df_targets.sort_values("Need Score", ascending=False).head(10)
-            fig = px.bar(
-                top10, x="Player", y=["Need Score", "Base Score"],
-                barmode="overlay", title="Need-Adjusted vs Base Waiver Score",
-                labels={"value": "Score", "variable": ""},
-                color_discrete_map={"Need Score": "steelblue", "Base Score": "lightgray"},
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            fig = px.bar(df_targets.head(10), x="Player", y=["Need Score", "Base Score"],
+                         barmode="overlay", title="Need-Adjusted vs Base Waiver Score",
+                         labels={"value": "Score", "variable": ""},
+                         color_discrete_map={"Need Score": "steelblue", "Base Score": "lightgray"})
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("No available players found — sync your league to populate the waiver pool.")

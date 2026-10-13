@@ -1,205 +1,202 @@
-import os
-import time
-import pickle
+"""
+NFL weekly stats (nflverse) and the per-player stats index.
+
+- Regular-season games only (playoff weeks are dropped at load).
+- Team abbreviations normalized to Sleeper's (LA → LAR).
+- Players keyed by nflverse player_id (= Sleeper gsis_id), with a strict
+  normalized-name fallback (see src/players.py).
+- Every game a player recorded stats in counts as a game, including 0-point
+  and negative games. "Recent" means the last N NFL weeks, not the last N rows.
+"""
+
+import logging
 from datetime import date
+
+import numpy as np
 import pandas as pd
 
-CACHE_DIR = "data"
+from src.players import normalize_name, norm_team
+from src.storage import data_path, is_fresh, write_parquet_atomic
+
+log = logging.getLogger(__name__)
+
 CACHE_TTL = 86400  # 24 hours
+NFLVERSE_WEEKLY_URL = "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{year}.parquet"
 
 
 def current_nfl_season() -> int:
     """
-    Return the most recently completed (or in-progress) NFL season year.
-    NFL seasons are labeled by the year they START (e.g. 2025 season = Sept 2025–Feb 2026).
-    Sep–Dec: current calendar year is the active season.
-    Jan–Aug: previous calendar year was the most recent season.
+    The most recently started NFL season. Seasons are labeled by the year they
+    start (2025 season = Sept 2025–Feb 2026), so Jan–Aug maps to last year.
     """
     today = date.today()
     return today.year if today.month >= 9 else today.year - 1
 
 
-def _cache_path(year):
-    return os.path.join(CACHE_DIR, f"weekly_stats_{year}.pkl")
+def _prepare(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if "season_type" in df.columns:
+        df = df[df["season_type"] == "REG"]
+    df = df.copy()
+    for col in ("team", "opponent_team"):
+        if col in df.columns:
+            df[col] = df[col].map(norm_team)
+    return df.sort_values(["player_id", "week"]).reset_index(drop=True)
 
 
-NFLVERSE_WEEKLY_URL = "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{year}.parquet"
+def _load_season(year: int, force: bool) -> pd.DataFrame:
+    path = data_path(f"weekly_stats_{year}.parquet")
+    if not force and is_fresh(path, CACHE_TTL):
+        return pd.read_parquet(path)
+    try:
+        df = pd.read_parquet(NFLVERSE_WEEKLY_URL.format(year=year))
+        if not df.empty:
+            write_parquet_atomic(df, path)
+        return df
+    except Exception as e:
+        log.warning("nflverse: no weekly data for %s (%s)", year, e)
+        if path.exists():  # stale cache beats nothing
+            log.warning("nflverse: using stale cache for %s", year)
+            return pd.read_parquet(path)
+        return pd.DataFrame()
 
 
-def fetch_weekly_stats(year: int | None = None) -> pd.DataFrame:
+def fetch_weekly_stats(year: int | None = None, force: bool = False) -> pd.DataFrame:
     """
-    Fetch nflverse weekly player stats with 24h file cache.
-    Defaults to current NFL season; falls back to previous season if data unavailable.
+    Regular-season weekly player stats for `year` (default: current season),
+    falling back to the previous season if the current one has no data yet.
     """
     if year is None:
         year = current_nfl_season()
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-    def _load(yr: int) -> pd.DataFrame:
-        path = _cache_path(yr)
-        if os.path.exists(path):
-            age = time.time() - os.path.getmtime(path)
-            if age < CACHE_TTL:
-                with open(path, "rb") as f:
-                    return pickle.load(f)
-        try:
-            df = pd.read_parquet(NFLVERSE_WEEKLY_URL.format(year=yr), engine="auto")
-        except Exception as e:
-            print(f"nflverse: no weekly data for {yr} ({e})")
-            return pd.DataFrame()
-        if not df.empty:
-            with open(path, "wb") as f:
-                pickle.dump(df, f)
-        return df
-
-    df = _load(year)
+    df = _prepare(_load_season(year, force))
     if df.empty:
-        # Season year exists but nfl_data_py has no data yet — use prior season
-        df = _load(year - 1)
+        df = _prepare(_load_season(year - 1, force))
     return df
 
 
-def _pick_fp_col(df: pd.DataFrame, scoring: dict) -> str:
-    """Return the fantasy_points column name appropriate for the scoring settings."""
-    rec = scoring.get("rec", 0.5)
-    if rec >= 1.0:
-        return "fantasy_points_ppr"
-    elif rec <= 0.0:
-        return "fantasy_points"
-    else:
-        # Half-PPR or custom: interpolate between standard and PPR
-        return "_fp_half"  # signal to caller to compute
+# ── Stats index ───────────────────────────────────────────────────────────────
+
+_EMPTY_STATS = {
+    "season": {"ppg": 0.0, "total": 0.0, "games": 0},
+    "recent": {"ppg": None, "weeks": 0, "games": 0},
+    "weekly": [],
+    "weeks": [],
+    "found": False,
+}
+
+_USAGE_COLS = ["target_share", "air_yards_share", "wopr", "racr"]
 
 
-def _compute_fp(row, scoring: dict) -> float:
-    """Compute fantasy points for a single row using scoring settings."""
-    rec = scoring.get("rec", 0.5)
-    std = row.get("fantasy_points", 0) or 0
-    ppr = row.get("fantasy_points_ppr", 0) or 0
-    if rec >= 1.0:
-        return ppr
-    elif rec <= 0.0:
-        return std
-    else:
-        # interpolate: standard + rec * receptions
-        receptions = row.get("receptions", 0) or 0
-        return std + rec * receptions
-
-
-def _fuzzy_match_name(target: str, candidates: list) -> str | None:
-    """Simple fuzzy match: exact → last-name → contains."""
-    target_lower = target.lower()
-    # Exact
-    for c in candidates:
-        if c.lower() == target_lower:
-            return c
-    # Last name match
-    target_last = target_lower.split()[-1]
-    matches = [c for c in candidates if c.lower().split()[-1] == target_last]
-    if len(matches) == 1:
-        return matches[0]
-    # Contains
-    contains = [c for c in candidates if target_last in c.lower()]
-    if len(contains) == 1:
-        return contains[0]
-    return None
-
-
-def get_player_stats(name: str, df: pd.DataFrame, scoring: dict, recent_weeks: int = 4) -> dict:
-    """Return season and recent stats dict for a player name."""
-    col_names = df["player_display_name"].dropna().unique().tolist()
-    matched = _fuzzy_match_name(name, col_names)
-    if not matched:
-        return {"season": {}, "recent": {}, "weekly": []}
-
-    player_df = df[df["player_display_name"] == matched].copy()
-    player_df = player_df.sort_values("week")
-
-    fp_col = _pick_fp_col(player_df, scoring)
-    if fp_col == "_fp_half":
-        player_df["_fp"] = player_df.apply(lambda r: _compute_fp(r.to_dict(), scoring), axis=1)
-        fp_col = "_fp"
-
-    all_pts = player_df[fp_col].fillna(0).tolist()
-    games_played = len([p for p in all_pts if p > 0])
-    season_ppg = round(sum(all_pts) / games_played, 2) if games_played else 0
-
-    recent_pts = all_pts[-recent_weeks:]
-    recent_games = len([p for p in recent_pts if p > 0])
-    recent_ppg = round(sum(recent_pts) / recent_games, 2) if recent_games else 0
-
-    return {
-        "season": {"ppg": season_ppg, "total": round(sum(all_pts), 1), "games": games_played},
-        "recent": {"ppg": recent_ppg, "weeks": recent_weeks},
-        "weekly": [round(p, 1) for p in all_pts],
-    }
-
-
-def get_usage_trends(name: str, df: pd.DataFrame, recent_weeks: int = 4) -> dict:
+class StatsIndex:
     """
-    Compute target share and air yards share trends for a player.
-    Returns recent averages and direction vs. season average.
-    trend > 0 = rising usage, < 0 = falling.
+    Pre-grouped per-player stats built once per (stats data, scoring) pair.
+    `df` must already have an `fp` column (see src.scoring.compute_fantasy_points).
     """
-    col_names = df["player_display_name"].dropna().unique().tolist()
-    matched = _fuzzy_match_name(name, col_names)
-    if not matched:
-        return {}
 
-    pdf = df[df["player_display_name"] == matched].sort_values("week").copy()
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+        self.season = int(df["season"].iloc[0]) if not df.empty and "season" in df.columns else None
+        self.last_week = int(df["week"].max()) if not df.empty else 0
+        self.by_id: dict[str, dict] = {}
+        self.by_name: dict[str, list[str]] = {}
+        if df.empty:
+            return
 
-    result = {}
-    for col, label in [("target_share", "target_share"), ("air_yards_share", "air_yards_share"),
-                        ("wopr", "wopr"), ("racr", "racr")]:
-        if col not in pdf.columns:
-            continue
-        vals = pdf[col].fillna(0).tolist()
-        if not vals:
-            continue
-        season_avg = round(sum(vals) / len(vals), 3)
-        recent = vals[-recent_weeks:]
-        recent_avg = round(sum(recent) / len(recent), 3) if recent else 0.0
-        result[label] = {
-            "season_avg": season_avg,
-            "recent_avg": recent_avg,
-            "trend": round(recent_avg - season_avg, 3),
+        weeks = df["week"].to_numpy()
+        fps = df["fp"].to_numpy(dtype=float)
+        for pid, rows in df.groupby("player_id", sort=False).indices.items():
+            last = rows[-1]
+            name = df.at[last, "player_display_name"]
+            self.by_id[pid] = {
+                "name": name,
+                "position": df.at[last, "position"],
+                "team": df.at[last, "team"],
+                "rows": rows,
+                "weeks": weeks[rows].tolist(),
+                "pts": fps[rows].tolist(),
+            }
+            self.by_name.setdefault(normalize_name(name), []).append(pid)
+
+    # -- lookup -----------------------------------------------------------------
+
+    def resolve(self, player) -> str | None:
+        """nflverse player_id for a player dict (or bare name), or None."""
+        if isinstance(player, str):
+            player = {"name": player}
+        gid = player.get("gsis_id")
+        if gid and gid in self.by_id:
+            return gid
+        ids = self.by_name.get(normalize_name(player.get("name", "")), [])
+        if len(ids) > 1 and player.get("position"):
+            ids = [i for i in ids if self.by_id[i]["position"] == player["position"]] or ids
+        if len(ids) > 1 and player.get("team"):
+            ids = [i for i in ids if self.by_id[i]["team"] == player["team"]] or ids
+        return ids[0] if len(ids) == 1 else None
+
+    def get_player_stats(self, player, recent_weeks: int = 4) -> dict:
+        pid = self.resolve(player)
+        if not pid:
+            return {k: (dict(v) if isinstance(v, dict) else list(v) if isinstance(v, list) else v)
+                    for k, v in _EMPTY_STATS.items()}
+        entry = self.by_id[pid]
+        pts, wks = entry["pts"], entry["weeks"]
+        games = len(pts)
+        total = sum(pts)
+
+        cutoff = self.last_week - recent_weeks
+        recent = [p for p, w in zip(pts, wks) if w > cutoff]
+        recent_ppg = round(sum(recent) / len(recent), 2) if recent else None
+
+        return {
+            "season": {"ppg": round(total / games, 2) if games else 0.0, "total": round(total, 1), "games": games},
+            "recent": {"ppg": recent_ppg, "weeks": recent_weeks, "games": len(recent)},
+            "weekly": [round(p, 1) for p in pts],
+            "weeks": list(wks),
+            "found": True,
+            "gsis_id": pid,
+            "matched_name": entry["name"],
+            "position": entry["position"],
+            "team": entry["team"],
         }
 
-    # For RBs: carry share via carries / team_carries proxy using rush_attempts
-    if "carries" in pdf.columns and not pdf["carries"].isna().all():
-        carries = pdf["carries"].fillna(0).tolist()
-        recent_c = carries[-recent_weeks:]
-        result["recent_carries_pg"] = round(sum(recent_c) / max(len(recent_c), 1), 1)
+    def get_usage_trends(self, player, recent_weeks: int = 4) -> dict:
+        """Target share / air yards share / WOPR: recent average vs. season average."""
+        pid = self.resolve(player)
+        if not pid:
+            return {}
+        pdf = self.df.iloc[self.by_id[pid]["rows"]]
+        recent_mask = pdf["week"] > self.last_week - recent_weeks
 
-    return result
+        result = {}
+        for col in _USAGE_COLS:
+            if col not in pdf.columns:
+                continue
+            vals = pd.to_numeric(pdf[col], errors="coerce").fillna(0)
+            recent = vals[recent_mask]
+            season_avg = round(float(vals.mean()), 3)
+            recent_avg = round(float(recent.mean()), 3) if len(recent) else season_avg
+            result[col] = {"season_avg": season_avg, "recent_avg": recent_avg,
+                           "trend": round(recent_avg - season_avg, 3)}
 
+        if "carries" in pdf.columns and pdf["carries"].notna().any():
+            carries = pd.to_numeric(pdf["carries"], errors="coerce").fillna(0)[recent_mask]
+            if len(carries):
+                result["recent_carries_pg"] = round(float(carries.mean()), 1)
+        return result
 
-def rank_available_players(players: list, df: pd.DataFrame, scoring: dict) -> list:
-    """
-    Bulk-join nfl_data_py stats onto list of player dicts.
-    Each player dict needs at least 'name'. Adds season_ppg and recent_ppg.
-    """
-    # Build a lookup: display_name -> aggregated stats
-    fp_col = _pick_fp_col(df, scoring)
-    work_df = df.copy()
-    if fp_col == "_fp_half":
-        work_df["_fp"] = work_df.apply(lambda r: _compute_fp(r.to_dict(), scoring), axis=1)
-        fp_col = "_fp"
+    def rank_available_players(self, players: list) -> list:
+        """Attach season_ppg / recent_ppg / games / stats_found to each player dict."""
+        out = []
+        for p in players:
+            s = self.get_player_stats(p)
+            out.append({**p, "season_ppg": s["season"]["ppg"], "recent_ppg": s["recent"]["ppg"],
+                        "games": s["season"]["games"], "stats_found": s["found"]})
+        return out
 
-    grouped = work_df.groupby("player_display_name")[fp_col].apply(list).to_dict()
-    col_names = list(grouped.keys())
-
-    enriched = []
-    for p in players:
-        name = p.get("name", "")
-        matched = _fuzzy_match_name(name, col_names)
-        pts = grouped.get(matched, []) if matched else []
-        pts = [x for x in pts if x is not None]
-        games = len([x for x in pts if x > 0])
-        season_ppg = round(sum(pts) / games, 2) if games else 0.0
-        recent_pts = pts[-4:]
-        recent_games = len([x for x in recent_pts if x > 0])
-        recent_ppg = round(sum(recent_pts) / recent_games, 2) if recent_games else 0.0
-        enriched.append({**p, "season_ppg": season_ppg, "recent_ppg": recent_ppg})
-
-    return enriched
+    def season_ppg_table(self, min_games: int = 1) -> pd.DataFrame:
+        """One row per player: position, games, ppg (used for replacement levels)."""
+        rows = [{"player_id": pid, "position": e["position"], "games": len(e["pts"]),
+                 "ppg": float(np.mean(e["pts"]))}
+                for pid, e in self.by_id.items() if len(e["pts"]) >= min_games]
+        return pd.DataFrame(rows, columns=["player_id", "position", "games", "ppg"])

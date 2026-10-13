@@ -1,212 +1,189 @@
+"""
+Sleeper API integration: league sync and the shared player database.
+
+The full player database (~15 MB) is downloaded at most once per TTL and shared
+by sync, injuries, and ID lookups — Sleeper asks clients to call /players/nfl
+no more than about once a day.
+"""
+
+import logging
+from datetime import datetime, timezone
+
 import requests
-import json
-import os
-import time
+
+from src.players import RELEVANT_POSITIONS, sleeper_to_player
+from src.storage import data_path, file_age_seconds, is_fresh, read_json, write_json_atomic
+
+log = logging.getLogger(__name__)
 
 BASE_URL = "https://api.sleeper.app/v1"
 TIMEOUT = 10
-CACHE_PATH = "data/sleeper_players.json"
-
-RELEVANT_POSITIONS = {"QB", "RB", "WR", "TE", "K", "DEF"}
-
-
-def _ensure_data_dir():
-    if not os.path.exists("data"):
-        os.makedirs("data")
+PLAYERS_TTL = 12 * 3600
+FAAB_WAIVER_TYPE = 2  # Sleeper settings.waiver_type: 0 rolling, 1 reverse standings, 2 FAAB
 
 
-def fetch_all_players():
-    """Fetches all players from Sleeper and caches them locally (24h TTL)."""
-    _ensure_data_dir()
+def _players_cache():
+    return data_path("sleeper_players.json")
 
-    if os.path.exists(CACHE_PATH):
-        age = time.time() - os.path.getmtime(CACHE_PATH)
-        if age < 86400:
-            with open(CACHE_PATH, "r") as f:
-                return json.load(f)
 
-    print("Fetching full Sleeper player database...")
+def _get(path: str, timeout: int = TIMEOUT):
+    """GET a Sleeper endpoint → (json, None) or (None, error message)."""
     try:
-        response = requests.get(f"{BASE_URL}/players/nfl", timeout=60)
-        if response.status_code == 200:
-            players = response.json()
-            with open(CACHE_PATH, "w") as f:
-                json.dump(players, f)
-            return players
-    except Exception as e:
-        print(f"Error fetching player database: {e}")
-
-    if os.path.exists(CACHE_PATH):
-        with open(CACHE_PATH, "r") as f:
-            return json.load(f)
-    return {}
-
-
-def get_user_id(username):
+        r = requests.get(f"{BASE_URL}{path}", timeout=timeout)
+    except requests.RequestException as e:
+        return None, f"Network error contacting Sleeper: {e}"
+    if r.status_code != 200:
+        return None, f"Sleeper returned HTTP {r.status_code} for {path}"
     try:
-        r = requests.get(f"{BASE_URL}/user/{username}", timeout=TIMEOUT)
-        if r.status_code == 200:
-            return r.json().get("user_id")
-    except Exception as e:
-        print(f"Error fetching user ID: {e}")
-    return None
+        return r.json(), None
+    except ValueError:
+        return None, f"Sleeper returned invalid JSON for {path}"
 
 
-def get_league_info(league_id):
-    try:
-        r = requests.get(f"{BASE_URL}/league/{league_id}", timeout=TIMEOUT)
-        if r.status_code == 200:
-            return r.json()
-    except Exception as e:
-        print(f"Error fetching league info: {e}")
-    return None
+# ── Player database ───────────────────────────────────────────────────────────
+
+def fetch_all_players(force: bool = False) -> dict:
+    """All Sleeper NFL players {player_id: info}, file-cached for PLAYERS_TTL."""
+    path = _players_cache()
+    if not force and is_fresh(path, PLAYERS_TTL):
+        return read_json(path)
+
+    players, err = _get("/players/nfl", timeout=60)
+    if players:
+        write_json_atomic(players, path)
+        return players
+
+    log.warning("Player database fetch failed: %s", err)
+    return read_json(path) if path.exists() else {}
 
 
-def get_leagues(user_id, season="2025"):
-    try:
-        r = requests.get(f"{BASE_URL}/user/{user_id}/leagues/nfl/{season}", timeout=TIMEOUT)
-        if r.status_code == 200:
-            return r.json()
-    except Exception as e:
-        print(f"Error fetching leagues: {e}")
-    return []
+def players_db_age_seconds() -> float | None:
+    return file_age_seconds(_players_cache())
 
 
-def get_roster_data(league_id, user_id):
-    try:
-        r = requests.get(f"{BASE_URL}/league/{league_id}/rosters", timeout=TIMEOUT)
-        if r.status_code == 200:
-            for roster in r.json():
-                if roster["owner_id"] == user_id:
-                    return roster
-    except Exception as e:
-        print(f"Error fetching roster: {e}")
-    return None
+# ── League lookups ────────────────────────────────────────────────────────────
+
+def get_nfl_season() -> str:
+    """Current NFL season per Sleeper (/state/nfl), falling back to the calendar."""
+    state, _ = _get("/state/nfl")
+    if state and state.get("season"):
+        return str(state["season"])
+    from src.wrangler import current_nfl_season
+    return str(current_nfl_season())
 
 
-def get_trending_players(type="add", hours=24):
-    try:
-        r = requests.get(
-            f"{BASE_URL}/players/nfl/trending/{type}?lookback_hours={hours}",
-            timeout=TIMEOUT,
-        )
-        if r.status_code == 200:
-            return r.json()
-    except Exception as e:
-        print(f"Error fetching trending players: {e}")
-    return []
+def get_trending_players(kind: str = "add", hours: int = 24) -> list:
+    data, err = _get(f"/players/nfl/trending/{kind}?lookback_hours={hours}")
+    if err:
+        log.warning("Trending players unavailable: %s", err)
+    return data or []
 
 
-def get_available_waivers(league_id, all_players_cache):
+def parse_faab_budget(league: dict, roster: dict) -> int:
+    """Remaining FAAB = league waiver_budget − this roster's waiver_budget_used."""
+    total = (league.get("settings") or {}).get("waiver_budget", 100) or 0
+    used = (roster.get("settings") or {}).get("waiver_budget_used", 0) or 0
+    return max(0, int(total) - int(used))
+
+
+def build_waiver_pool(rosters: list, players_db: dict, trend_map: dict) -> list:
     """
-    Returns all available (unrostered) active NFL players.
-    No hard cap — UI handles filtering.
+    Every active, team-affiliated player at a fantasy position who isn't on a
+    roster. Injured players are kept (useful stashes); the UI filters them.
     """
-    try:
-        r = requests.get(f"{BASE_URL}/league/{league_id}/rosters", timeout=TIMEOUT)
-        if r.status_code != 200:
-            return []
+    owned = set()
+    for r in rosters:
+        owned.update(r.get("players") or [])
+        owned.update(r.get("reserve") or [])
+        owned.update(r.get("taxi") or [])
 
-        # Collect all owned player IDs (including IR)
-        owned_ids = set()
-        for roster in r.json():
-            owned_ids.update(roster.get("players") or [])
+    available = []
+    for p_id, p_info in players_db.items():
+        if p_id in owned or not p_info.get("active") or not p_info.get("team"):
+            continue
+        if p_info.get("position") not in RELEVANT_POSITIONS:
+            continue
+        p = sleeper_to_player(p_id, p_info)
+        p["trend_count"] = trend_map.get(p_id, 0)
+        available.append(p)
 
-        # Get trending adds for context
-        trending_raw = get_trending_players("add")
-        trend_map = {item["player_id"]: item["count"] for item in trending_raw}
-
-        available = []
-        for p_id, p_info in all_players_cache.items():
-            # Skip owned
-            if p_id in owned_ids:
-                continue
-            # Active players with a team
-            if not p_info.get("active"):
-                continue
-            team = p_info.get("team")
-            if not team:
-                continue
-            pos = p_info.get("position", "")
-            if pos not in RELEVANT_POSITIONS:
-                continue
-            # Skip known cut/injured statuses
-            status = p_info.get("injury_status", "")
-            if status in ("PUP", "IR", "Out", "Doubtful"):
-                continue
-
-            available.append({
-                "name": p_info.get("full_name", "Unknown"),
-                "position": pos,
-                "team": team,
-                "player_id": p_id,
-                "trend_count": trend_map.get(p_id, 0),
-            })
-
-        # Sort: trending first, then alphabetical
-        available.sort(key=lambda x: (-x["trend_count"], x["name"]))
-        return available
-
-    except Exception as e:
-        print(f"Error identifying waivers: {e}")
-    return []
+    available.sort(key=lambda x: (-x["trend_count"], x["name"]))
+    return available
 
 
-def sync_sleeper_league(username, league_id_or_name):
+def _find_league(user_id: str, league_id_or_name: str):
+    """Returns (league, error, current_season)."""
+    season = get_nfl_season()
+    if league_id_or_name.isdigit() and len(league_id_or_name) > 10:
+        league, err = _get(f"/league/{league_id_or_name}")
+        return league, (None if league else err or "League not found."), season
+
+    for s in (season, str(int(season) - 1)):
+        leagues, err = _get(f"/user/{user_id}/leagues/nfl/{s}")
+        if err:
+            return None, err, season
+        match = next((l for l in leagues or [] if l.get("name", "").lower() == league_id_or_name.lower()), None)
+        if match:
+            return match, None, season
+    return None, f"Could not find a league named '{league_id_or_name}' in {season} or {int(season) - 1}.", season
+
+
+def sync_sleeper_league(username: str, league_id_or_name: str):
+    """Returns (league_data, None) on success or (None, error message)."""
     if not username or not league_id_or_name:
         return None, "Please enter both username and league identifier."
 
-    user_id = get_user_id(username)
-    if not user_id:
-        return None, f"Sleeper user '{username}' not found."
+    user, err = _get(f"/user/{username}")
+    if not user:
+        return None, err if err and "HTTP 404" not in err else f"Sleeper user '{username}' not found."
+    user_id = user.get("user_id")
 
-    target_league = None
-    if league_id_or_name.isdigit() and len(league_id_or_name) > 10:
-        target_league = get_league_info(league_id_or_name)
+    league, err, current_season = _find_league(user_id, league_id_or_name)
+    if not league:
+        return None, err
 
-    if not target_league:
-        for season in ["2025", "2024"]:
-            leagues = get_leagues(user_id, season)
-            target_league = next(
-                (l for l in leagues
-                 if l["name"].lower() == league_id_or_name.lower()
-                 or l["league_id"] == league_id_or_name),
-                None,
-            )
-            if target_league:
-                break
+    league_id = league["league_id"]
+    rosters, err = _get(f"/league/{league_id}/rosters")
+    if rosters is None:
+        return None, err
 
-    if not target_league:
-        return None, f"Could not find league '{league_id_or_name}'."
+    my_roster = next(
+        (r for r in rosters if r.get("owner_id") == user_id or user_id in (r.get("co_owners") or [])),
+        None,
+    )
+    if not my_roster:
+        return None, f"'{username}' doesn't own a roster in {league.get('name', league_id)}."
 
-    league_id = target_league["league_id"]
-    display_name = target_league["name"]
+    players_db = fetch_all_players()
+    if not players_db:
+        return None, "Couldn't load the Sleeper player database. Try again shortly."
 
-    roster_raw = get_roster_data(league_id, user_id)
-    if not roster_raw:
-        return None, "Roster not found in league."
+    roster_ids = my_roster.get("players") or []
+    roster = [sleeper_to_player(p_id, players_db.get(p_id, {})) for p_id in roster_ids]
+    reserve = set(my_roster.get("reserve") or [])
+    for p in roster:
+        if p["player_id"] in reserve:
+            p["slot"] = "IR"
 
-    all_players = fetch_all_players()
-    player_ids = roster_raw.get("players") or []
+    trend_map = {t["player_id"]: t.get("count", 0) for t in get_trending_players("add")}
+    settings = league.get("settings") or {}
 
-    formatted_roster = []
-    for p_id in player_ids:
-        p_info = all_players.get(p_id, {})
-        name = p_info.get("full_name") or p_info.get("last_name") or p_id
-        pos = p_info.get("position") or "UNK"
-        team = p_info.get("team") or ""
-        formatted_roster.append({"name": name, "position": pos, "team": team})
-
-    waivers = get_available_waivers(league_id, all_players)
-
-    formatted_data = {
-        "team_name": display_name,
+    data = {
         "league_id": league_id,
+        "league_name": league.get("name", ""),
+        "team_name": league.get("name", ""),  # kept for older UI code / labels
+        "season": str(league.get("season", "")),
+        "current_season": current_season,
         "platform": "Sleeper",
-        "budget": int(roster_raw.get("settings", {}).get("fleaflicker_budget", 100)),
-        "roster": formatted_roster,
-        "waivers": waivers,
-        "scoring_settings": target_league.get("scoring_settings", {}),
-        "roster_positions": target_league.get("roster_positions", []),
+        "budget": parse_faab_budget(league, my_roster),
+        "faab_enabled": settings.get("waiver_type") == FAAB_WAIVER_TYPE,
+        "total_rosters": league.get("total_rosters") or len(rosters),
+        "playoff_week_start": settings.get("playoff_week_start"),
+        "roster": roster,
+        "waivers": build_waiver_pool(rosters, players_db, trend_map),
+        "scoring_settings": league.get("scoring_settings", {}),
+        "roster_positions": league.get("roster_positions", []),
+        "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    return formatted_data, None
+    return data, None
+

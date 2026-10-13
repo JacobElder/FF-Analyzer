@@ -2,22 +2,25 @@
 Schedule analysis: upcoming matchups, playoff schedule strength, and weather.
 
 Weather via Open-Meteo (free, no API key required).
-Schedule via nfl_data_py.import_schedules().
+Schedule via the nflverse games file.
 """
 
-import os
-import time
-import pickle
-import requests
-import pandas as pd
+import logging
 from datetime import date, datetime
 
-SCHEDULE_CACHE = "data/schedules_{year}.pkl"
-SCHEDULE_TTL = 86400  # 24 hours
+import pandas as pd
+import requests
 
+from src.defense import get_matchup_info
+from src.players import norm_team
+from src.storage import data_path, is_fresh, write_parquet_atomic
+
+log = logging.getLogger(__name__)
+
+SCHEDULE_TTL = 86400  # 24 hours
 NFLVERSE_GAMES_URL = "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.parquet"
 
-# Covered/dome stadiums — weather-immune
+# Covered/dome stadiums — weather-immune (Sleeper abbreviations)
 COVERED = {"ARI", "ATL", "DAL", "DET", "HOU", "IND", "LAC", "LAR", "LV", "MIN", "NO"}
 
 # Stadium coordinates (lat, lon) keyed by home team abbreviation
@@ -40,105 +43,96 @@ STADIUM_COORDS = {
     "TEN": (36.1665, -86.7713),  "WAS": (38.9076, -76.8645),
 }
 
-PLAYOFF_WEEKS = (14, 15, 16)  # typical fantasy playoff weeks
+PLAYOFF_WEEKS = (15, 16, 17)  # Sleeper's default fantasy playoffs; leagues override via playoff_week_start
+
+
+def playoff_weeks_for(playoff_week_start: int | None) -> tuple:
+    if playoff_week_start:
+        start = int(playoff_week_start)
+        return (start, start + 1, start + 2)
+    return PLAYOFF_WEEKS
 
 
 # ── Schedule data ─────────────────────────────────────────────────────────────
 
-def fetch_schedules(year: int | None = None) -> pd.DataFrame:
-    """Fetch season schedule with 24h file cache."""
+def fetch_schedules(year: int | None = None, force: bool = False) -> pd.DataFrame:
+    """Regular-season schedule for `year` with a 24h file cache."""
     from src.wrangler import current_nfl_season
     if year is None:
         year = current_nfl_season()
+    path = data_path(f"schedules_{year}.parquet")
 
-    os.makedirs("data", exist_ok=True)
-    path = SCHEDULE_CACHE.format(year=year)
-
-    if os.path.exists(path):
-        if time.time() - os.path.getmtime(path) < SCHEDULE_TTL:
-            with open(path, "rb") as f:
-                return pickle.load(f)
+    if not force and is_fresh(path, SCHEDULE_TTL):
+        return pd.read_parquet(path)
 
     try:
-        df = pd.read_parquet(NFLVERSE_GAMES_URL, engine="auto")
-        df = df[df["season"] == year].copy()
-        reg = df[df["game_type"] == "REG"].copy() if "game_type" in df.columns else df.copy()
-        with open(path, "wb") as f:
-            pickle.dump(reg, f)
-        return reg
+        df = pd.read_parquet(NFLVERSE_GAMES_URL)
+        df = df[df["season"] == year]
+        if "game_type" in df.columns:
+            df = df[df["game_type"] == "REG"]
+        df = df.copy()
+        for col in ("home_team", "away_team"):
+            df[col] = df[col].map(norm_team)
+        write_parquet_atomic(df, path)
+        return df
     except Exception as e:
-        print(f"Schedule fetch failed: {e}")
-        return pd.DataFrame()
+        log.warning("Schedule fetch failed: %s", e)
+        return pd.read_parquet(path) if path.exists() else pd.DataFrame()
 
 
 # ── Next game lookup ──────────────────────────────────────────────────────────
 
 def get_next_game(team: str, schedules_df: pd.DataFrame) -> dict | None:
-    """
-    Find the next unplayed game for a team.
-    Returns None during offseason or if schedule unavailable.
-    """
+    """Next unplayed game for a team, or None (offseason / schedule unavailable)."""
     if schedules_df is None or schedules_df.empty or not team:
         return None
 
-    team_games = schedules_df[
-        (schedules_df["home_team"] == team) | (schedules_df["away_team"] == team)
-    ].copy()
-
-    # Unplayed = no home_score (null/NaN)
+    team_games = schedules_df[(schedules_df["home_team"] == team) | (schedules_df["away_team"] == team)]
     if "home_score" in team_games.columns:
-        upcoming = team_games[team_games["home_score"].isna()]
-    else:
-        upcoming = team_games
-
-    if upcoming.empty:
+        team_games = team_games[team_games["home_score"].isna()]
+    if team_games.empty:
         return None
 
-    upcoming = upcoming.sort_values("week")
-    row = upcoming.iloc[0]
-
+    row = team_games.sort_values("week").iloc[0]
     is_home = row["home_team"] == team
-    opponent = row["away_team"] if is_home else row["home_team"]
-
     return {
         "week":      int(row["week"]),
-        "opponent":  opponent,
-        "is_home":   is_home,
+        "opponent":  row["away_team"] if is_home else row["home_team"],
+        "is_home":   bool(is_home),
         "gameday":   str(row.get("gameday", "")),
         "gametime":  str(row.get("gametime", "")),
         "home_team": row["home_team"],
     }
 
 
+def next_game_map(schedules_df: pd.DataFrame) -> dict:
+    """team → next game dict, for every team on the schedule."""
+    if schedules_df is None or schedules_df.empty:
+        return {}
+    teams = set(schedules_df["home_team"]) | set(schedules_df["away_team"])
+    return {t: get_next_game(t, schedules_df) for t in teams}
+
+
 # ── Weather ───────────────────────────────────────────────────────────────────
 
-def get_weather_for_game(next_game: dict | None) -> dict | None:
+def get_weather_for_game(home_team: str, gameday: str) -> dict | None:
     """
-    Fetch weather forecast for the next game via Open-Meteo (free, no key).
-    Returns None for dome/covered stadiums or during offseason.
+    Daily forecast for a game via Open-Meteo. Returns {"dome": True} for covered
+    stadiums and None when unavailable (no coords, past game, beyond forecast range).
 
-    Flags: wind_mph >= 15 (affects passing), precipitation > 0.5mm, temp_f < 35.
+    Flags: wind ≥ 15 mph, precipitation ≥ 0.5mm, max temp < 35°F.
     """
-    if not next_game:
-        return None
-
-    home_team = next_game.get("home_team", "")
     if home_team in COVERED:
         return {"dome": True, "note": "Indoor/dome — weather irrelevant"}
 
     coords = STADIUM_COORDS.get(home_team)
-    if not coords:
-        return None
-
-    gameday = next_game.get("gameday", "")
-    if not gameday or gameday == "None":
+    if not coords or not gameday or gameday == "None":
         return None
 
     try:
-        # Parse game date
         game_date = datetime.strptime(gameday, "%Y-%m-%d").date()
         if game_date < date.today():
-            return None  # game already played
+            return None
 
         lat, lon = coords
         resp = requests.get(
@@ -159,29 +153,28 @@ def get_weather_for_game(next_game: dict | None) -> dict | None:
             return None
 
         data = resp.json().get("daily", {})
-        temp_f = data.get("temperature_2m_max", [None])[0]
-        precip = data.get("precipitation_sum", [None])[0]
-        wind = data.get("windspeed_10m_max", [None])[0]
+        temp_f = (data.get("temperature_2m_max") or [None])[0]
+        precip = (data.get("precipitation_sum") or [None])[0]
+        wind = (data.get("windspeed_10m_max") or [None])[0]
 
         flags = []
-        if wind and wind >= 15:
+        if wind is not None and wind >= 15:
             flags.append(f"⚠️ Wind {wind:.0f} mph — suppresses passing")
-        if precip and precip >= 0.5:
+        if precip is not None and precip >= 0.5:
             flags.append(f"🌧️ Precipitation {precip:.1f}mm expected")
-        if temp_f and temp_f < 35:
+        if temp_f is not None and temp_f < 35:
             flags.append(f"🥶 Cold ({temp_f:.0f}°F) — outdoor cold-weather game")
 
         return {
-            "dome":    False,
-            "temp_f":  round(temp_f, 0) if temp_f else None,
-            "wind_mph": round(wind, 0) if wind else None,
-            "precip_mm": round(precip, 1) if precip else None,
-            "flags":   flags,
-            "note":    "; ".join(flags) if flags else "No significant weather concerns",
+            "dome":      False,
+            "temp_f":    round(temp_f) if temp_f is not None else None,
+            "wind_mph":  round(wind) if wind is not None else None,
+            "precip_mm": round(precip, 1) if precip is not None else None,
+            "flags":     flags,
+            "note":      "; ".join(flags) if flags else "No significant weather concerns",
         }
-
     except Exception as e:
-        print(f"Weather fetch failed: {e}")
+        log.warning("Weather fetch failed: %s", e)
         return None
 
 
@@ -190,49 +183,36 @@ def get_weather_for_game(next_game: dict | None) -> dict | None:
 def get_playoff_schedule_strength(
     team: str,
     schedules_df: pd.DataFrame,
-    defense_df: pd.DataFrame,
+    matchup_table: dict,
     position: str,
     playoff_weeks: tuple = PLAYOFF_WEEKS,
 ) -> dict:
     """
-    For each fantasy playoff week, find the opponent and their defense quality
-    for the given position. Returns aggregate difficulty grade.
-
-    Grade: A (easiest) → F (hardest) based on avg multiplier vs. league average.
+    Opponent defense quality for each fantasy playoff week.
+    Grade: A (easiest) → F (hardest) from the average matchup multiplier.
     """
-    from src.defense import get_matchup_info
-
-    if schedules_df is None or schedules_df.empty or defense_df is None or defense_df.empty:
+    if not team or schedules_df is None or schedules_df.empty or not matchup_table:
         return {"grade": "N/A", "weeks": [], "avg_multiplier": 1.0}
 
-    team_games = schedules_df[
-        (schedules_df["home_team"] == team) | (schedules_df["away_team"] == team)
-    ]
+    team_games = schedules_df[(schedules_df["home_team"] == team) | (schedules_df["away_team"] == team)]
 
-    weeks_info = []
-    multipliers = []
-
+    weeks_info, multipliers = [], []
     for wk in playoff_weeks:
         game = team_games[team_games["week"] == wk]
         if game.empty:
+            weeks_info.append({"week": wk, "opponent": "BYE", "matchup": "—", "multiplier": None})
             continue
         row = game.iloc[0]
         opponent = row["away_team"] if row["home_team"] == team else row["home_team"]
-        matchup = get_matchup_info(opponent, position, defense_df)
-        mult = matchup["multiplier"]
-        multipliers.append(mult)
-        weeks_info.append({
-            "week":     wk,
-            "opponent": opponent,
-            "matchup":  matchup["rank_label"],
-            "multiplier": mult,
-        })
+        matchup = get_matchup_info(opponent, position, matchup_table)
+        multipliers.append(matchup["multiplier"])
+        weeks_info.append({"week": wk, "opponent": opponent, "matchup": matchup["rank_label"],
+                           "multiplier": matchup["multiplier"]})
 
     if not multipliers:
         return {"grade": "N/A", "weeks": weeks_info, "avg_multiplier": 1.0}
 
     avg = sum(multipliers) / len(multipliers)
-
     if avg >= 1.20:
         grade = "A"
     elif avg >= 1.08:
@@ -243,5 +223,4 @@ def get_playoff_schedule_strength(
         grade = "D"
     else:
         grade = "F"
-
     return {"grade": grade, "weeks": weeks_info, "avg_multiplier": round(avg, 3)}

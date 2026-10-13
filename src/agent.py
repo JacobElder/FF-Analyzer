@@ -1,110 +1,131 @@
+"""
+Optional LLM narrative analysis (Claude or Gemini).
+
+Prompts carry the app's own computed context (matchup, injury, Vegas, usage,
+model scores) and the system prompt forbids inventing news, because model
+training data is older than this week's injury report.
+
+Model IDs are configurable via CLAUDE_MODEL / GEMINI_MODEL in .env.
+"""
+
 import os
+
 from dotenv import load_dotenv
+
+from src.scoring import DEFAULT_SCORING, scoring_label
 
 load_dotenv()
 
-DEFAULT_SCORING = {
-    "rec": 0.5,
-    "pass_yd": 0.04,
-    "pass_td": 4.0,
-    "pass_int": -2.0,
-    "rush_yd": 0.1,
-    "rush_td": 6.0,
-    "rec_yd": 0.1,
-    "rec_td": 6.0,
-    "fum_lost": -2.0,
-}
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+_KEY_ENV = {"claude": "ANTHROPIC_API_KEY", "gemini": "GOOGLE_API_KEY"}
+
+SYSTEM_PROMPT = (
+    "You are a concise fantasy football analyst. Base your analysis ONLY on the data in the "
+    "user's message. Your training data is out of date: do not cite injuries, depth-chart "
+    "changes, trades, suspensions, or news that are not in the provided data. If something "
+    "important is missing (e.g. no stats found), say so plainly instead of guessing."
+)
+
+
+def _fmt_context(context: dict | None) -> str:
+    if not context:
+        return "  (no additional context)"
+    return "\n".join(f"  {k}: {v}" for k, v in context.items() if v not in (None, "", []))
+
+
+def _fmt_stats(stats: dict, last_n: int = 6) -> str:
+    if not stats or not stats.get("found", True) and not stats.get("weekly"):
+        return "  No stats found for this season."
+    s = stats.get("season") or {}
+    r = stats.get("recent") or {}
+    weekly = stats.get("weekly") or []
+    weekly_str = ", ".join(str(round(w, 1)) for w in weekly[-last_n:]) if weekly else "no games"
+    recent = r.get("ppg")
+    return (f"  Season PPG: {s.get('ppg', 'N/A')} over {s.get('games', 0)} games\n"
+            f"  Last {r.get('weeks', 4)} weeks PPG: {recent if recent is not None else 'did not play'}\n"
+            f"  Most recent game scores: {weekly_str}")
 
 
 class FantasyAgent:
-    def __init__(self, provider="claude"):
+    def __init__(self, provider: str = "claude"):
         self.provider = provider
-        if provider == "claude":
-            import anthropic
-            self._client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        else:
-            import google.generativeai as genai
-            genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-            self._model = genai.GenerativeModel("gemini-2.0-flash")
 
     def analyze(self, prompt: str) -> str:
+        key_name = _KEY_ENV.get(self.provider, "ANTHROPIC_API_KEY")
+        api_key = os.getenv(key_name)
+        if not api_key:
+            return f"⚠️ **API key not configured.** Add `{key_name}` to your `.env` file."
         try:
             if self.provider == "claude":
-                msg = self._client.messages.create(
-                    model="claude-sonnet-4-6",
+                import anthropic
+                client = anthropic.Anthropic(api_key=api_key)
+                msg = client.messages.create(
+                    model=CLAUDE_MODEL,
                     max_tokens=1024,
+                    system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt}],
                 )
-                return msg.content[0].text
-            else:
-                response = self._model.generate_content(prompt)
-                return response.text
-        except TypeError as e:
-            key = "ANTHROPIC_API_KEY" if self.provider == "claude" else "GOOGLE_API_KEY"
-            return f"⚠️ **API key not configured.** Add `{key}` to your `.env` file.\n\nError: {e}"
+                return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+            from google import genai
+            from google.genai import types
+            client = genai.Client(api_key=api_key)
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+            )
+            return resp.text or "⚠️ The model returned an empty response."
+        except ImportError as e:
+            return f"⚠️ **AI package not installed:** {e}. Run `pip install -r requirements.txt`."
         except Exception as e:
             return f"⚠️ **AI analysis failed:** {e}"
 
-    def analyze_waiver(self, player_name, stats, roster, scoring=None, budget=100) -> str:
+    def analyze_waiver(self, player_name, stats, roster, scoring=None, budget=100, context=None) -> str:
         scoring = scoring or DEFAULT_SCORING
-        rec_str = "PPR" if scoring.get("rec", 0) >= 1 else ("Half-PPR" if scoring.get("rec", 0) >= 0.5 else "Standard")
         roster_names = ", ".join(p["name"] for p in roster) if roster else "Unknown"
-        season_ppg = stats.get("season", {}).get("ppg", "N/A")
-        recent_ppg = stats.get("recent", {}).get("ppg", "N/A")
-        weekly = stats.get("weekly", [])
-        weekly_str = ", ".join(str(round(w, 1)) for w in weekly[-6:]) if weekly else "No data"
-
-        prompt = f"""You are a fantasy football analyst. Evaluate this waiver wire pickup in a {rec_str} league.
+        prompt = f"""Evaluate this waiver wire pickup in a {scoring_label(scoring)} league.
 
 Player: {player_name}
-Season PPG: {season_ppg}
-Last 4 weeks PPG: {recent_ppg}
-Recent weekly scores: {weekly_str}
+{_fmt_stats(stats)}
+Context from my data:
+{_fmt_context(context)}
 Available FAAB budget: ${budget}
 My current roster: {roster_names}
 
-Provide a concise analysis (3-5 sentences): Is this a worthwhile pickup? Why or why not?
-Mention matchup trends, role, and any injury/usage context you know about.
+Give a concise analysis (3-5 sentences): is this a worthwhile pickup, and why or why not?
 End with: RECOMMENDATION: [ADD / STREAM / AVOID]"""
         return self.analyze(prompt)
 
-    def analyze_start_sit(self, p1_name, p2_name, p1_stats, p2_stats, scoring=None) -> str:
+    def analyze_start_sit(self, p1_name, p2_name, p1_stats, p2_stats, scoring=None, contexts=None) -> str:
         scoring = scoring or DEFAULT_SCORING
-        rec_str = "PPR" if scoring.get("rec", 0) >= 1 else ("Half-PPR" if scoring.get("rec", 0) >= 0.5 else "Standard")
-
-        def fmt(stats):
-            s = stats.get("season", {})
-            r = stats.get("recent", {})
-            w = stats.get("weekly", [])
-            weekly_str = ", ".join(str(round(x, 1)) for x in w[-4:]) if w else "No data"
-            return f"Season PPG: {s.get('ppg', 'N/A')}, Recent PPG: {r.get('ppg', 'N/A')}, Last 4 weeks: {weekly_str}"
-
-        prompt = f"""You are a fantasy football analyst. Help me decide who to start in a {rec_str} league.
+        contexts = contexts or {}
+        prompt = f"""Help me decide who to start this week in a {scoring_label(scoring)} league.
 
 Player 1: {p1_name}
-{fmt(p1_stats)}
+{_fmt_stats(p1_stats, 4)}
+{_fmt_context(contexts.get(p1_name))}
 
 Player 2: {p2_name}
-{fmt(p2_stats)}
+{_fmt_stats(p2_stats, 4)}
+{_fmt_context(contexts.get(p2_name))}
 
-Give a concise comparison (3-4 sentences) covering recent form, role, and any matchup factors.
+Give a concise comparison (3-4 sentences) covering recent form, matchup, and injury status.
 End with: START: [Player Name]"""
         return self.analyze(prompt)
 
-    def analyze_trade(self, giving, receiving, stats_map, scoring=None) -> str:
+    def analyze_trade(self, giving, receiving, stats_map, scoring=None, contexts=None, trade_summary=None) -> str:
         scoring = scoring or DEFAULT_SCORING
-        rec_str = "PPR" if scoring.get("rec", 0) >= 1 else ("Half-PPR" if scoring.get("rec", 0) >= 0.5 else "Standard")
+        contexts = contexts or {}
 
         def summarize(names):
-            lines = []
-            for name in names:
-                s = stats_map.get(name, {})
-                ppg = s.get("season", {}).get("ppg", "N/A")
-                recent = s.get("recent", {}).get("ppg", "N/A")
-                lines.append(f"  {name}: Season PPG {ppg}, Recent PPG {recent}")
-            return "\n".join(lines) if lines else "  (no stats available)"
+            if not names:
+                return "  (nothing)"
+            return "\n".join(f"- {n}\n{_fmt_stats(stats_map.get(n, {}), 4)}\n{_fmt_context(contexts.get(n))}"
+                             for n in names)
 
-        prompt = f"""You are a fantasy football analyst. Evaluate this trade in a {rec_str} league.
+        prompt = f"""Evaluate this trade in a {scoring_label(scoring)} league.
 
 YOU GIVE:
 {summarize(giving)}
@@ -112,6 +133,9 @@ YOU GIVE:
 YOU RECEIVE:
 {summarize(receiving)}
 
-Analyze the value of each side based on stats, age, role, and trajectory (4-5 sentences).
+My model's assessment:
+{_fmt_context(trade_summary)}
+
+Analyze the value of each side based on the stats and context above (4-5 sentences).
 End with: VERDICT: [ACCEPT / DECLINE / NEGOTIATE]"""
         return self.analyze(prompt)

@@ -1,80 +1,83 @@
-# 🏈 Agentic Fantasy Football Assistant (FF-Analyzer)
+# 🏈 FF Analyzer
 
-An AI-powered assistant that uses the Gemini API (multimodal) to help you dominate your fantasy football leagues. Manage multiple leagues, parse roster screenshots, and get data-driven FAAB/waiver advice.
+A Streamlit dashboard for Sleeper fantasy football leagues: waiver targets with FAAB bids, start/sit
+comparisons, trade analysis, and roster-construction grades. It uses nflverse weekly stats scored with
+your league's own settings, plus opponent defense, injuries, weather and (optionally) Vegas totals.
+Optional Claude or Gemini narratives summarize the numbers.
 
-## 🚀 Quick Start
+## Quick start
 
-1. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. **Setup API Key**:
-   Ensure your Gemini API key is in the `.env` file (already configured during setup).
-3. **Run the Dashboard**:
-   From the project root, execute:
-   ```bash
-   streamlit run app.py
-   ```
+```bash
+pip install -r requirements.txt
+cp .env.example .env        # optional: AI keys, Odds API key, Sleeper defaults
+streamlit run app.py
+```
 
----
+In the sidebar, open **➕ Sync from Sleeper** and enter your Sleeper username and league **name** (or the current
+season's league ID). The name always finds this season's league; Sleeper issues a new ID every season.
 
-## 📖 User Guide
+## What each tab does
 
-### 1. Syncing Your Leagues
-The assistant supports multiple ways to bring in your data depending on the platform:
+| Tab | What you get |
+|---|---|
+| 📋 Roster | Season/recent PPG, games, injury status and next matchup for every rostered player. Players with no stats this season are flagged instead of silently showing 0. |
+| 🔄 Waivers | The full unrostered pool (sortable, filterable, injured players hidden by default). The deep dive gives a 0–100 value score, a FAAB bid from your remaining budget, a drop candidate, matchup/weather/usage/Vegas context and a Monte Carlo outcome distribution. |
+| ⚖️ Who to Start | Compare 2–4 roster players on projected points: value × this week's opponent-defense multiplier × injury factor (an Out player is never recommended). |
+| 🤝 Trade | Pick players to give from your roster and players to receive from any NFL team. The verdict comes from your **best starting lineup before vs. after**, so a 2-for-1 is judged by who would actually start. Per-player value over replacement and playoff-week schedule strength are also shown. |
+| 🏗️ Roster Construction | Position grades against league-specific replacement levels, plus waiver targets boosted where you're weak. |
 
-#### 📡 Sleeper (API Sync)
-1. Open the **➕ Add League** expander in the sidebar.
-2. Select the **Sleeper API** tab.
-3. Enter your **Sleeper Username** and the **League ID** (from the Sleeper URL) or the exact **League Name**.
-4. Click **Sync from Sleeper**. The app will automatically fetch your roster and remaining FAAB budget.
+**🔄 Refresh data** in the sidebar re-downloads everything (stats, schedule, Sleeper players/injuries, odds).
+The sidebar warns when your sync is more than 2 days old: the waiver pool is a snapshot and won't drop players other managers have claimed until you re-sync.
 
-#### 🟣 Yahoo Fantasy (Multimodal Sync)
-Since Yahoo requires a complex OAuth2 setup, the most efficient way to sync is via Gemini's vision:
-1. Take a screenshot of your Yahoo Roster page.
-2. In the **Screenshot Parsing** section of the dashboard, upload the image.
-3. Click **Parse Roster with Gemini**. The agent will extract your team into the current league state.
+## How the numbers are built
 
-### 2. Managing Multiple Leagues
-- **Switching**: Use the "Select League" dropdown in the sidebar.
-- **Manual Creation**: Use the **Manual** tab under **➕ Add League** to start a league from scratch.
+- **Stats**: nflverse weekly player stats, regular season only. Before the current season has data, the app
+  falls back to last season and says so.
+- **Scoring**: fantasy points are computed from raw box-score columns using your league's Sleeper scoring
+  (passing/rushing/receiving, 2-pt conversions, fumbles, kicking, position reception bonuses such as TE premium).
+  Yardage-milestone bonuses are not modeled.
+- **Player matching**: Sleeper `gsis_id` ↔ nflverse `player_id`, falling back to an exact normalized name
+  (suffixes and accents ignored) disambiguated by position and team. There is no fuzzy or last-name matching.
+- **Games and form**: every game a player recorded stats in counts, including 0-point games. "Recent" means the
+  last 4 NFL weeks.
+- **Value**: expected points = 65% recent + 35% season, adjusted ±30% for week-to-week consistency.
+- **Replacement level**: the PPG of the first player past the league's rostered depth at each position. Depth is
+  derived from team count and lineup slots (FLEX and SUPER_FLEX included).
+- **Monte Carlo**: a zero-inflated Gamma fitted to each player's weekly scores (10,000 draws). Samples are seeded
+  per player, so every chart and probability for that player uses the same draws.
 
-### 2. Updating Your Roster
-You can update your roster in two ways:
-- **Via Screenshot (Recommended)**: 
-  1. Go to the **Screenshot Parsing** section.
-  2. Upload a clear image of your fantasy app's roster page.
-  3. Click **Parse Roster with Gemini**. The agent will extract player names and positions automatically.
-- **Via Manual Edit**: 
-  You can directly edit the JSON file in the `leagues/` directory for fine-grained control over player stats and names.
+## Configuration (`.env`)
 
-### 3. Getting Waiver Wire Advice
-- **Single Player Evaluation**: In the **Fantasy Evaluator & FAAB** section, type the name of the player you are considering picking up.
-- **Evaluation Logic**: The assistant cross-references the player against your current roster's needs (e.g., if you are weak at RB, it prioritizes RBs).
+| Variable | Purpose |
+|---|---|
+| `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` | Enables AI narratives (either one). |
+| `CLAUDE_MODEL` / `GEMINI_MODEL` | Override model IDs (defaults: `claude-sonnet-5-5`, `gemini-2.5-flash`). |
+| `ODDS_API_KEY` | Vegas implied team totals ([the-odds-api.com](https://the-odds-api.com), free tier). |
+| `SLEEPER_USERNAME` / `SLEEPER_LEAGUE` | Pre-fill the sync form. |
 
-### 4. FAAB vs. Normal Waiver Mode
-- **Toggle FAAB**: Use the **💰 FAAB Mode** toggle in the sidebar.
-- **FAAB Mode (ON)**: The assistant calculates a specific dollar amount bid based on your remaining budget and the player's "Value Score."
-- **Normal Mode (OFF)**: The assistant provides a priority ranking (1-5) instead of a monetary bid.
+## Project layout
 
-### 5. Fantasy League Settings
-- **Budget**: Your remaining FAAB budget is tracked per league. You can see it in the Evaluator section.
-- **Scoring/Settings**: Currently, the agent uses standard logic. To customize, you can prompt the agent via the code or update the `roster.json` structure to include specific scoring formats (PPR, Half-PPR).
+```
+app.py                     Streamlit UI
+src/
+  scoring.py               League scoring → fantasy points (vectorized)
+  wrangler.py              nflverse stats download + per-player StatsIndex
+  players.py               Name/team normalization, Sleeper ↔ nflverse ID linking
+  sleeper_integration.py   League sync, FAAB budget, waiver pool, shared player DB
+  evaluator.py             Value model, waiver scores, start/sit, lineup-based trades, roster grades
+  simulator.py             Monte Carlo simulations
+  defense.py               Points allowed by defense × position
+  schedule.py              Next games, playoff schedule strength, weather
+  injuries.py              Injury statuses from the Sleeper player DB
+  vegas.py                 Implied team totals
+  state_manager.py         League files (leagues/<league_id>.json)
+  storage.py               Cache paths and atomic file writes
+tests/                     pytest suite (python -m pytest)
+```
 
-### 6. Asking for Advice
-- Use the **Value Score** slider to tell the agent how much "hype" or "expert consensus" a player has.
-- Click **Generate Recommendation** to get a detailed breakdown of whether to add the player and how much to spend.
+Caches live in `data/` and league files in `leagues/`. Both are plain files, and you can delete `data/` at any time.
 
----
+## Not yet implemented
 
-## 🛠️ Project Structure
-
-- `app.py`: The visual dashboard and user interface.
-- `leagues/`: Directory containing JSON files for each of your fantasy leagues.
-- `src/agent.py`: The brain of the operation. Uses Gemini to "see" screenshots and "think" about roster moves.
-- `src/evaluator.py`: The math engine for FAAB bids and player scoring.
-- `src/wrangler.py`: Handles fetching real NFL stats to back up the agent's advice.
-
-## 🤖 Agentic Features
-- **Multimodal Vision**: Gemini doesn't just read text; it understands the layout of fantasy apps (Sleeper, ESPN, Yahoo) from screenshots.
-- **Natural Language Reasoning**: You can extend the `agent.py` to handle complex queries like "Should I drop my backup TE for a flyer on this rookie WR?"
+Screenshot roster parsing, Yahoo/ESPN sync, and natural-language roster edits from the original PRD
+(`FF-Analyzer (PRD).md`) are not built. Sleeper is the only supported platform.

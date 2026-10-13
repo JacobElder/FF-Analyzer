@@ -1,36 +1,51 @@
 """
 Monte Carlo simulation for fantasy football decisions.
-Uses Gamma distribution (non-negative, right-skewed) fitted to historical weekly scores.
-Falls back to Normal when data is sparse (<4 data points).
+
+Each player's weekly score is a zero-inflated Gamma: a "dud" probability equal
+to their share of ≤0-point games, otherwise Gamma fitted to positive scores.
+Falls back to Normal when data is sparse.
+
+Samples are seeded per player (name + scoring history), so the same player
+always gets the same samples. Every chart and probability for that player is
+then computed from identical draws, and lineup comparisons use common random
+numbers for players on both sides.
 """
+
+import zlib
 
 import numpy as np
 from scipy import stats as sp_stats
 
 N_SAMPLES = 10_000
-RNG = np.random.default_rng(42)
 
 
 # ── Distribution fitting ──────────────────────────────────────────────────────
 
-def _fit_samples(weekly_pts: list, fallback_mean: float) -> np.ndarray:
-    """Fit a Gamma to non-zero scores; fall back to Normal if too few points."""
-    pts = np.array([p for p in weekly_pts if p > 0], dtype=float)
+def _seed(key: str, weekly: list) -> int:
+    return zlib.crc32(f"{key}|{weekly}".encode())
 
-    if len(pts) >= 4:
+
+def _fit_samples(weekly_pts: list, fallback_mean: float, rng: np.random.Generator) -> np.ndarray:
+    pts = np.asarray(weekly_pts, dtype=float)
+    positive = pts[pts > 0]
+
+    if len(pts) >= 4 and len(positive) >= 4:
         try:
-            shape, _, scale = sp_stats.gamma.fit(pts, floc=0)
+            shape, _, scale = sp_stats.gamma.fit(positive, floc=0)
             if shape > 0 and scale > 0:
-                samples = RNG.gamma(shape, scale, N_SAMPLES)
-                return np.clip(samples, 0, None)
+                samples = rng.gamma(shape, scale, N_SAMPLES)
+                p_dud = float(np.mean(pts <= 0))
+                if p_dud > 0:
+                    samples[rng.random(N_SAMPLES) < p_dud] = 0.0
+                return samples
         except Exception:
             pass
 
-    # Fallback: Normal parameterised from available data or expected value
+    # Fallback: Normal from available data, or from the expected value
     mean = float(np.mean(pts)) if len(pts) >= 2 else (fallback_mean or 10.0)
     std = float(np.std(pts)) if len(pts) >= 2 else mean * 0.5
     std = max(std, 1.0)  # prevent degenerate distribution
-    return np.clip(RNG.normal(mean, std, N_SAMPLES), 0, None)
+    return np.clip(rng.normal(mean, std, N_SAMPLES), 0, None)
 
 
 def _summary(samples: np.ndarray) -> dict:
@@ -45,80 +60,103 @@ def _summary(samples: np.ndarray) -> dict:
     }
 
 
-def simulate_player(stats: dict) -> np.ndarray:
-    """Return N_SAMPLES simulated weekly fantasy point outcomes for a player."""
+def simulate_player(stats: dict, key: str = "", multiplier: float = 1.0) -> np.ndarray:
+    """
+    N_SAMPLES simulated weekly outcomes. `multiplier` scales for this week's
+    matchup / injury (0 for an inactive player).
+    """
     weekly = stats.get("weekly") or []
-    fallback = (
-        (stats.get("recent") or {}).get("ppg")
-        or (stats.get("season") or {}).get("ppg")
-        or 10.0
-    )
-    return _fit_samples(weekly, fallback)
+    recent = (stats.get("recent") or {}).get("ppg")
+    fallback = recent if recent is not None else ((stats.get("season") or {}).get("ppg") or 10.0)
+    rng = np.random.default_rng(_seed(key, weekly))
+    return _fit_samples(weekly, fallback, rng) * multiplier
+
+
+def _p_greater(a: np.ndarray, b: np.ndarray) -> float:
+    """P(a > b), counting exact ties as half."""
+    return float(np.mean(a > b) + 0.5 * np.mean(a == b))
 
 
 # ── Decision simulations ──────────────────────────────────────────────────────
 
-def simulate_start_sit(p1_name: str, p1_stats: dict,
-                       p2_name: str, p2_stats: dict) -> dict:
-    """
-    Head-to-head Monte Carlo.
-    Returns P(p1 > p2), P(p2 > p1), and 80% credible intervals for each.
-    """
-    s1 = simulate_player(p1_stats)
-    s2 = simulate_player(p2_stats)
-    p1_win = float(np.mean(s1 > s2))
-
+def simulate_start_sit(p1_name: str, p1_stats: dict, p2_name: str, p2_stats: dict,
+                       multipliers: dict | None = None) -> dict:
+    """Head-to-head: P(p1 > p2), P(p2 > p1), and 80% intervals."""
+    m = multipliers or {}
+    s1 = simulate_player(p1_stats, p1_name, m.get(p1_name, 1.0))
+    s2 = simulate_player(p2_stats, p2_name, m.get(p2_name, 1.0))
+    p1_win = _p_greater(s1, s2)
     return {
-        "start":        p1_name if p1_win >= 0.5 else p2_name,
-        "p1_win_prob":  round(p1_win, 3),
-        "p2_win_prob":  round(1 - p1_win, 3),
-        p1_name:        _summary(s1),
-        p2_name:        _summary(s2),
+        "start":       p1_name if p1_win >= 0.5 else p2_name,
+        "p1_win_prob": round(p1_win, 3),
+        "p2_win_prob": round(1 - p1_win, 3),
+        p1_name:       _summary(s1),
+        p2_name:       _summary(s2),
     }
 
 
-def simulate_multi_start(named_stats: dict) -> dict:
-    """
-    Multi-player Monte Carlo (2–4 players).
-    Returns win probability and credible interval for each player.
-    """
+def simulate_multi_start(named_stats: dict, multipliers: dict | None = None) -> dict:
+    """Multi-player (2–4): probability each player scores the most, plus intervals."""
+    m = multipliers or {}
     names = list(named_stats.keys())
-    samples = {n: simulate_player(s) for n, s in named_stats.items()}
-    arr = np.array([samples[n] for n in names])   # (n_players, N_SAMPLES)
+    samples = {n: simulate_player(s, n, m.get(n, 1.0)) for n, s in named_stats.items()}
+    arr = np.array([samples[n] for n in names])
     winners = np.argmax(arr, axis=0)
 
     win_probs = {names[i]: round(float(np.mean(winners == i)), 3) for i in range(len(names))}
-    summaries = {n: _summary(samples[n]) for n in names}
-    best = max(win_probs, key=win_probs.get)
+    return {
+        "best": max(win_probs, key=win_probs.get),
+        "win_probs": win_probs,
+        "summaries": {n: _summary(samples[n]) for n in names},
+        "samples": samples,
+    }
 
-    return {"best": best, "win_probs": win_probs, "summaries": summaries}
+
+def _verdict(p_better: float) -> str:
+    if p_better >= 0.55:
+        return "ACCEPT"
+    if p_better <= 0.45:
+        return "DECLINE"
+    return "NEGOTIATE"
+
+
+def simulate_lineup_change(before_names: list, after_names: list, stats_by_name: dict) -> dict:
+    """
+    Weekly starting-lineup totals before vs. after a trade. Players on both
+    lineups share the same samples, so only the changed starters drive the
+    difference.
+    """
+    cache = {}
+
+    def samples(name):
+        if name not in cache:
+            cache[name] = simulate_player(stats_by_name.get(name, {}), name)
+        return cache[name]
+
+    before = sum((samples(n) for n in before_names if n), np.zeros(N_SAMPLES))
+    after = sum((samples(n) for n in after_names if n), np.zeros(N_SAMPLES))
+    p_better = _p_greater(after, before)
+    return {
+        "verdict": _verdict(p_better),
+        "p_better": round(p_better, 3),
+        "before": _summary(before), "after": _summary(after),
+        "before_samples": before, "after_samples": after,
+    }
 
 
 def simulate_trade(giving_stats: dict, receiving_stats: dict) -> dict:
     """
-    Simulate total weekly output for both sides of a trade.
-    Returns P(receiving side outscores giving side) and credible intervals.
+    Total weekly output of each side (used when no roster is loaded).
+    Either side may be empty.
     """
-    def total(stats_dict):
-        t = np.zeros(N_SAMPLES)
-        for s in stats_dict.values():
-            t += simulate_player(s)
-        return t
-
-    give_s = total(giving_stats)
-    recv_s = total(receiving_stats)
-    p_better = float(np.mean(recv_s > give_s))
-
-    if p_better >= 0.55:
-        verdict = "ACCEPT"
-    elif p_better <= 0.45:
-        verdict = "DECLINE"
-    else:
-        verdict = "NEGOTIATE"
-
+    give = sum((simulate_player(s, n) for n, s in giving_stats.items()), np.zeros(N_SAMPLES))
+    recv = sum((simulate_player(s, n) for n, s in receiving_stats.items()), np.zeros(N_SAMPLES))
+    p_better = _p_greater(recv, give)
     return {
-        "verdict":           verdict,
-        "p_receive_better":  round(p_better, 3),
-        "give":              _summary(give_s),
-        "receive":           _summary(recv_s),
+        "verdict":          _verdict(p_better),
+        "p_receive_better": round(p_better, 3),
+        "give":             _summary(give),
+        "receive":          _summary(recv),
+        "give_samples":     give,
+        "receive_samples":  recv,
     }
