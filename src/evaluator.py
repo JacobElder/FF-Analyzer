@@ -290,15 +290,16 @@ def score_trade(
 
 # ── Roster construction analysis ─────────────────────────────────────────────
 
-# Typical roster slot requirements (12-team standard)
-_ROSTER_NEEDS = {
-    "QB":  {"min_starters": 1, "depth": 2},
-    "RB":  {"min_starters": 2, "depth": 4},
-    "WR":  {"min_starters": 2, "depth": 4},
-    "TE":  {"min_starters": 1, "depth": 2},
-    "K":   {"min_starters": 1, "depth": 1},
-    "DEF": {"min_starters": 1, "depth": 1},
-}
+# Positions graded when the league's lineup has a dedicated slot for them.
+# DEF is never graded: nflverse has no team-defense stats to value it with.
+_GRADED_POSITIONS = ("QB", "RB", "WR", "TE", "K")
+
+
+def roster_needs(roster_positions: list | None = None) -> dict:
+    """{pos: {"min_starters", "depth"}} from the league's dedicated lineup slots."""
+    slots = Counter(roster_positions or DEFAULT_ROSTER_POSITIONS)
+    return {pos: {"min_starters": slots[pos], "depth": slots[pos] if pos == "K" else slots[pos] * 2}
+            for pos in _GRADED_POSITIONS if slots.get(pos)}
 
 
 def analyze_roster_construction(
@@ -308,6 +309,7 @@ def analyze_roster_construction(
     available_stats: dict,
     replacement_levels: dict | None = None,
     matchup_mults: dict | None = None,
+    roster_positions: list | None = None,
 ) -> dict:
     """
     Grade each position on the roster and rank available players by how much
@@ -315,19 +317,22 @@ def analyze_roster_construction(
 
     matchup_mults: {name: next-game defense multiplier} so scores match the
     Waivers tab.
+    roster_positions: the league's lineup slots; only positions with a
+    dedicated slot are graded.
 
     Returns {"position_grades": {pos: grade_dict}, "weaknesses": [pos],
              "targeted_adds": [player_dict]}
     """
     repl = replacement_levels or POSITION_REPLACEMENT
     matchup_mults = matchup_mults or {}
+    needs = roster_needs(roster_positions)
 
     pos_players = {}
     for p in roster:
         pos_players.setdefault(p.get("position", ""), []).append(p["name"])
 
     position_grades = {}
-    for pos, config in _ROSTER_NEEDS.items():
+    for pos, config in needs.items():
         repl_ppg = repl.get(pos, POSITION_REPLACEMENT.get(pos, 10.0))
         values = sorted(
             ({"name": n, "adj_value": player_value(roster_stats.get(n, {}))["adj_value"]}
@@ -360,13 +365,13 @@ def analyze_roster_construction(
 
     weaknesses = [
         pos for pos, g in position_grades.items()
-        if g["grade"] in ("D", "F") or g["depth_count"] < _ROSTER_NEEDS[pos]["min_starters"]
+        if g["grade"] in ("D", "F") or g["depth_count"] < needs[pos]["min_starters"]
     ]
 
     targeted_adds = []
     for p in available_players:
         pos = p.get("position", "")
-        if pos not in _ROSTER_NEEDS:
+        if pos not in needs:
             continue
         stats = available_stats.get(p["name"], {})
         base = score_waiver(stats, pos, p.get("trend_count", 0),

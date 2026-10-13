@@ -4,3 +4,6 @@ data/
 *.pyc
 .streamlit/
 .DS_Store
+
+# League data is re-synced from Sleeper automatically
+leagues/*.json

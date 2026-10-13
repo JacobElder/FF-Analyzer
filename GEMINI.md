@@ -14,7 +14,9 @@ Streamlit dashboard for Sleeper fantasy football leagues. See README.md for feat
 - `src/players.py`: identity. Always look players up by player dict (`player_id`, `gsis_id`, `name`,
   `position`, `team`), not bare names. Matching must stay strict: no last-name or substring fallbacks.
 - `src/sleeper_integration.py`: the only module that downloads `/players/nfl` (shared cache, ≤ 2×/day).
-- League files: `leagues/<league_id>.json`, written only through `state_manager.save_league()`.
+- League files: `leagues/<league_id>.json` (git-ignored), written only through `state_manager.save_league()`.
+  Default leagues come from `config.toml` and are refreshed by `src/league_sync.py` when older than
+  `auto_sync_minutes`.
 
 ## Conventions
 - Team abbreviations are Sleeper style (`LAR`, `JAX`, `WAS`); normalize external data with `norm_team()`.

@@ -63,13 +63,17 @@ def players_db_age_seconds() -> float | None:
 
 # ── League lookups ────────────────────────────────────────────────────────────
 
-def get_nfl_season() -> str:
-    """Current NFL season per Sleeper (/state/nfl), falling back to the calendar."""
+def get_nfl_state() -> dict:
+    """Current NFL season/week per Sleeper (/state/nfl), falling back to the calendar."""
     state, _ = _get("/state/nfl")
     if state and state.get("season"):
-        return str(state["season"])
+        return {"season": str(state["season"]), "week": state.get("display_week") or state.get("week")}
     from src.wrangler import current_nfl_season
-    return str(current_nfl_season())
+    return {"season": str(current_nfl_season()), "week": None}
+
+
+def get_nfl_season() -> str:
+    return get_nfl_state()["season"]
 
 
 def get_trending_players(kind: str = "add", hours: int = 24) -> list:
@@ -111,21 +115,77 @@ def build_waiver_pool(rosters: list, players_db: dict, trend_map: dict) -> list:
     return available
 
 
+NON_STARTING_SLOTS = {"BN", "IR", "TAXI"}
+
+
+def assign_slots(starters: list, roster_positions: list, reserve: list, taxi: list) -> dict:
+    """
+    {player_id: lineup slot} for your current Sleeper lineup. `starters` is
+    ordered like the starting slots in roster_positions; "0" marks an empty slot.
+    """
+    starting_slots = [pos for pos in roster_positions if pos not in NON_STARTING_SLOTS]
+    slots = {pid: slot for slot, pid in zip(starting_slots, starters or []) if pid and pid != "0"}
+    for pid in reserve or []:
+        slots[pid] = "IR"
+    for pid in taxi or []:
+        slots[pid] = "Taxi"
+    return slots
+
+
+def _team_names(users: list) -> dict:
+    """user_id → team name (custom team name, else display name)."""
+    return {u["user_id"]: (u.get("metadata") or {}).get("team_name") or u.get("display_name") or "Unknown"
+            for u in users or [] if u.get("user_id")}
+
+
+def _record(roster: dict) -> dict:
+    st = roster.get("settings") or {}
+    return {
+        "wins": st.get("wins", 0), "losses": st.get("losses", 0), "ties": st.get("ties", 0),
+        "points_for": round((st.get("fpts") or 0) + (st.get("fpts_decimal") or 0) / 100, 2),
+        "waiver_position": st.get("waiver_position"),
+    }
+
+
+def _current_matchup(league_id: str, week, my_roster: dict, rosters: list, team_names: dict) -> dict | None:
+    if not week:
+        return None
+    matchups, err = _get(f"/league/{league_id}/matchups/{week}")
+    if not matchups:
+        if err:
+            log.warning("Matchup unavailable: %s", err)
+        return None
+    mine = next((m for m in matchups if m.get("roster_id") == my_roster.get("roster_id")), None)
+    if not mine or mine.get("matchup_id") is None:
+        return {"week": week, "bye": True}
+    opp = next((m for m in matchups if m.get("matchup_id") == mine["matchup_id"]
+                and m.get("roster_id") != mine["roster_id"]), None)
+    opp_roster = next((r for r in rosters if opp and r.get("roster_id") == opp["roster_id"]), {})
+    return {
+        "week": week,
+        "points": round(mine.get("points") or 0, 2),
+        "opponent": team_names.get(opp_roster.get("owner_id"), "Unknown") if opp else None,
+        "opponent_points": round(opp.get("points") or 0, 2) if opp else None,
+        "opponent_record": _record(opp_roster) if opp_roster else None,
+    }
+
+
 def _find_league(user_id: str, league_id_or_name: str):
-    """Returns (league, error, current_season)."""
-    season = get_nfl_season()
+    """Returns (league, error, nfl_state)."""
+    state = get_nfl_state()
+    season = state["season"]
     if league_id_or_name.isdigit() and len(league_id_or_name) > 10:
         league, err = _get(f"/league/{league_id_or_name}")
-        return league, (None if league else err or "League not found."), season
+        return league, (None if league else err or "League not found."), state
 
     for s in (season, str(int(season) - 1)):
         leagues, err = _get(f"/user/{user_id}/leagues/nfl/{s}")
         if err:
-            return None, err, season
+            return None, err, state
         match = next((l for l in leagues or [] if l.get("name", "").lower() == league_id_or_name.lower()), None)
         if match:
-            return match, None, season
-    return None, f"Could not find a league named '{league_id_or_name}' in {season} or {int(season) - 1}.", season
+            return match, None, state
+    return None, f"Could not find a league named '{league_id_or_name}' in {season} or {int(season) - 1}.", state
 
 
 def sync_sleeper_league(username: str, league_id_or_name: str):
@@ -138,7 +198,7 @@ def sync_sleeper_league(username: str, league_id_or_name: str):
         return None, err if err and "HTTP 404" not in err else f"Sleeper user '{username}' not found."
     user_id = user.get("user_id")
 
-    league, err, current_season = _find_league(user_id, league_id_or_name)
+    league, err, nfl_state = _find_league(user_id, league_id_or_name)
     if not league:
         return None, err
 
@@ -158,32 +218,47 @@ def sync_sleeper_league(username: str, league_id_or_name: str):
     if not players_db:
         return None, "Couldn't load the Sleeper player database. Try again shortly."
 
-    roster_ids = my_roster.get("players") or []
-    roster = [sleeper_to_player(p_id, players_db.get(p_id, {})) for p_id in roster_ids]
-    reserve = set(my_roster.get("reserve") or [])
-    for p in roster:
-        if p["player_id"] in reserve:
-            p["slot"] = "IR"
+    roster_positions = league.get("roster_positions") or []
+    reserve = my_roster.get("reserve") or []
+    taxi = my_roster.get("taxi") or []
+    roster_ids = list(dict.fromkeys((my_roster.get("players") or []) + reserve + taxi))
+    slots = assign_slots(my_roster.get("starters") or [], roster_positions, reserve, taxi)
+    roster = []
+    for p_id in roster_ids:
+        p = sleeper_to_player(p_id, players_db.get(p_id, {}))
+        p["slot"] = slots.get(p_id, "BN")
+        roster.append(p)
 
+    users, err = _get(f"/league/{league_id}/users")
+    if users is None:
+        log.warning("League users unavailable: %s", err)
+    team_names = _team_names(users)
     trend_map = {t["player_id"]: t.get("count", 0) for t in get_trending_players("add")}
     settings = league.get("settings") or {}
+    league_season = str(league.get("season", ""))
+    week = nfl_state.get("week") if league_season == nfl_state["season"] else None
 
     data = {
         "league_id": league_id,
         "league_name": league.get("name", ""),
-        "team_name": league.get("name", ""),  # kept for older UI code / labels
-        "season": str(league.get("season", "")),
-        "current_season": current_season,
+        "team_name": team_names.get(user_id) or user.get("display_name") or username,
+        "username": username,
+        "season": league_season,
+        "current_season": nfl_state["season"],
+        "status": league.get("status"),
+        "week": week,
         "platform": "Sleeper",
         "budget": parse_faab_budget(league, my_roster),
+        "waiver_budget_total": settings.get("waiver_budget", 100),
         "faab_enabled": settings.get("waiver_type") == FAAB_WAIVER_TYPE,
         "total_rosters": league.get("total_rosters") or len(rosters),
         "playoff_week_start": settings.get("playoff_week_start"),
+        "record": _record(my_roster),
+        "matchup": _current_matchup(league_id, week, my_roster, rosters, team_names),
         "roster": roster,
         "waivers": build_waiver_pool(rosters, players_db, trend_map),
         "scoring_settings": league.get("scoring_settings", {}),
-        "roster_positions": league.get("roster_positions", []),
+        "roster_positions": roster_positions,
         "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     return data, None
-

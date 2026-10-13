@@ -67,3 +67,11 @@ def test_starter_counts_scale_with_league():
     assert starter_counts(10)["QB"] < starter_counts(14)["QB"]
     sf = starter_counts(12, ["QB", "SUPER_FLEX", "RB", "RB", "WR", "WR", "TE"])
     assert sf["QB"] > starter_counts(12)["QB"]
+
+
+def test_roster_needs_follow_league_lineup():
+    from src.evaluator import roster_needs
+    no_kicker = roster_needs(["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "SUPER_FLEX", "DEF", "BN"])
+    assert "K" not in no_kicker and "DEF" not in no_kicker
+    assert no_kicker["WR"]["min_starters"] == 3
+    assert roster_needs(["QB", "K", "DEF"])["K"] == {"min_starters": 1, "depth": 1}

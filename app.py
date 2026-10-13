@@ -1,5 +1,4 @@
 import os
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -9,12 +8,14 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from src.agent import FantasyAgent
+from src.config import load_config
 from src.defense import EMPTY_MATCHUP, build_matchup_table, compute_defense_rankings, get_matchup_info
 from src.evaluator import (
     DEFAULT_ROSTER_POSITIONS, analyze_roster_construction, compute_positional_scarcity,
     injury_factor, rank_players, recommend_drop, score_trade, score_waiver, starter_counts,
 )
 from src.injuries import build_injury_map, injury_status, is_inactive
+from src.league_sync import auto_sync, leagues_due, sync_age_seconds
 from src.players import RELEVANT_POSITIONS, build_sleeper_name_index, enrich_with_ids, player_label, sleeper_to_player
 from src.schedule import (
     fetch_schedules, get_playoff_schedule_strength, get_weather_for_game, next_game_map, playoff_weeks_for,
@@ -112,24 +113,33 @@ if st.sidebar.button("🔄 Refresh data", help="Re-download stats, schedule, Sle
 st.sidebar.divider()
 st.sidebar.header("📁 League")
 
+CONFIG = load_config()
+SYNC_MAX_AGE = CONFIG["auto_sync_minutes"] * 60
+
+
+@st.cache_resource
+def _sync_state():
+    """Process-wide auto-sync bookkeeping: last attempt time and last error per league."""
+    return {"attempts": {}, "errors": {}}
+
+
+# Keep the default leagues current: re-sync any whose saved data is older than auto_sync_minutes
+_sync = _sync_state()
+if CONFIG["username"] and leagues_due(CONFIG["league_ids"], SYNC_MAX_AGE, _sync["attempts"]):
+    with st.spinner("Updating your leagues from Sleeper…"):
+        due = leagues_due(CONFIG["league_ids"], SYNC_MAX_AGE, _sync["attempts"])
+        errors = auto_sync(CONFIG["username"], CONFIG["league_ids"], SYNC_MAX_AGE, _sync["attempts"])
+    for lid in due:
+        if lid in errors:
+            _sync["errors"][lid] = errors[lid]
+        else:
+            _sync["errors"].pop(lid, None)
+
 if flash := st.session_state.pop("flash", None):
     st.sidebar.success(flash)
 
-with st.sidebar.expander("➕ Sync from Sleeper", expanded=not list_leagues()):
-    sleeper_user = st.text_input("Sleeper Username", value=os.getenv("SLEEPER_USERNAME", ""))
-    target_league = st.text_input("League ID or Name", value=os.getenv("SLEEPER_LEAGUE", ""),
-                                  help="Sleeper issues a new league ID every season — the name always finds the current one.")
-    if st.button("Sync"):
-        with st.spinner("Syncing from Sleeper..."):
-            data, err = sync_sleeper_league(sleeper_user.strip(), target_league.strip())
-        if data:
-            st.session_state.league_key = save_league(data)
-            st.session_state.flash = f"Synced: {data['league_name']} ({data['season']})"
-            st.rerun()
-        else:
-            st.error(err)
-
-leagues = list_leagues()
+_default_order = {lid: i for i, lid in enumerate(CONFIG["league_ids"])}
+leagues = sorted(list_leagues(), key=lambda kv: (_default_order.get(kv[0], len(_default_order)), kv[1].lower()))
 league_labels = dict(leagues)
 if leagues:
     if st.session_state.get("league_key") not in league_labels:
@@ -140,7 +150,22 @@ if leagues:
 else:
     selected_league = None
     current_data = {}
-    st.sidebar.info("No leagues yet — sync one above.")
+    st.sidebar.info("No leagues yet — add one below, or list your league IDs in config.toml.")
+
+with st.sidebar.expander("➕ Add another Sleeper league", expanded=not leagues):
+    sleeper_user = st.text_input("Sleeper Username", value=CONFIG["username"])
+    target_league = st.text_input("League ID or Name",
+                                  help="Sleeper issues a new league ID every season — the name always finds the current one. "
+                                       "Add the ID to config.toml to keep it synced automatically.")
+    if st.button("Sync"):
+        with st.spinner("Syncing from Sleeper..."):
+            data, err = sync_sleeper_league(sleeper_user.strip(), target_league.strip())
+        if data:
+            st.session_state.league_key = save_league(data)
+            st.session_state.flash = f"Synced: {data['league_name']} ({data['season']})"
+            st.rerun()
+        else:
+            st.error(err)
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -181,32 +206,88 @@ if _season_year and _season_year < _current_season:
 if not _players_db:
     st.warning("Sleeper player database unavailable — injury statuses and player lookups are disabled.")
 
-# Sync freshness / season warnings
+# ── Sidebar: team, sync status, league settings, budget ─────────────────────
+
+def _fmt_age(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{max(1, round(seconds / 60))} min ago"
+    if seconds < 86400:
+        return f"{seconds / 3600:.0f}h ago"
+    return f"{seconds / 86400:.0f} days ago"
+
+
+def _lineup_summary(positions: list) -> str:
+    counts = {}
+    for pos in positions:
+        counts[pos] = counts.get(pos, 0) + 1
+    starting = [f"{n} {pos}" if n > 1 else pos for pos, n in counts.items() if pos not in ("BN", "IR", "TAXI")]
+    extras = [f"{counts[k]} {label}" for k, label in (("BN", "bench"), ("IR", "IR"), ("TAXI", "taxi")) if k in counts]
+    return ", ".join(starting) + (f" (+ {', '.join(extras)})" if extras else "")
+
+
+_NOTABLE_SCORING = [("rec", "Reception"), ("pass_td", "Pass TD"), ("pass_int", "Interception"),
+                    ("fum_lost", "Fumble lost"), ("bonus_rec_te", "TE reception bonus"),
+                    ("bonus_rec_rb", "RB reception bonus"), ("bonus_rec_wr", "WR reception bonus")]
+
 if current_data:
-    synced_at = current_data.get("synced_at")
-    if synced_at:
-        age = datetime.now(timezone.utc) - datetime.fromisoformat(synced_at)
-        days = age.total_seconds() / 86400
-        age_str = f"{days:.0f} days ago" if days >= 1 else f"{age.total_seconds() / 3600:.0f}h ago"
-        st.sidebar.caption(f"Last synced {age_str}")
-        if days > STALE_SYNC_DAYS:
-            st.sidebar.warning("Roster and waiver pool may be stale — re-sync to drop players already claimed.")
+    record = current_data.get("record")
+    if record:
+        rec = f"{record['wins']}-{record['losses']}" + (f"-{record['ties']}" if record.get("ties") else "")
+        st.sidebar.markdown(f"**{current_data.get('team_name', '')}** · {rec} · {record['points_for']:g} PF")
+
+    is_default = selected_league in _default_order
+    age = sync_age_seconds(current_data)
+    if age is not None:
+        auto = f" · auto-updates every {CONFIG['auto_sync_minutes']:g} min" if is_default else ""
+        st.sidebar.caption(f"Synced {_fmt_age(age)}{auto}")
+        if not is_default and age > STALE_SYNC_DAYS * 86400:
+            st.sidebar.warning("Roster and waiver pool may be stale — sync to drop players already claimed.")
     elif roster:
-        st.sidebar.warning("Sync time unknown (older file). Re-sync to refresh the roster and waiver pool.")
+        st.sidebar.warning("Sync time unknown (older file). Sync to refresh the roster and waiver pool.")
+    if err := _sync["errors"].get(selected_league):
+        st.sidebar.warning(f"Auto-sync failed: {err}. Showing the last saved data.")
+
+    if current_data.get("league_id") and st.sidebar.button("🔄 Sync this league now"):
+        with st.spinner("Syncing from Sleeper..."):
+            data, err = sync_sleeper_league(current_data.get("username") or CONFIG["username"],
+                                            current_data["league_id"])
+        if data:
+            save_league(data)
+            _sync["errors"].pop(selected_league, None)
+            st.session_state.flash = f"Synced: {data['league_name']}"
+            st.rerun()
+        else:
+            st.sidebar.error(err)
+
     league_season = current_data.get("season")
     if league_season and str(league_season).isdigit() and int(league_season) < _current_season:
         st.sidebar.warning(f"This is the {league_season} league. Sleeper creates a new league ID each season — "
-                           "re-sync by league name to load the current one.")
+                           "sync by league name to load the current one.")
+
+    with st.sidebar.expander("📜 League Settings"):
+        settings_rows = [f"**Teams:** {num_teams}",
+                         f"**Lineup:** {_lineup_summary(current_data.get('roster_positions') or DEFAULT_ROSTER_POSITIONS)}",
+                         f"**Scoring:** {scoring_label(scoring)}"]
+        settings_rows += [f"- {label}: {scoring[key]:+g}" for key, label in _NOTABLE_SCORING if scoring.get(key)]
+        if current_data.get("faab_enabled", True):
+            total = current_data.get("waiver_budget_total")
+            settings_rows.append("**Waivers:** FAAB" + (f", ${total} season budget" if total else ""))
+        else:
+            settings_rows.append("**Waivers:** priority order (no FAAB)")
+        if record and record.get("waiver_position"):
+            settings_rows.append(f"**Your waiver position:** {record['waiver_position']}")
+        if current_data.get("playoff_week_start"):
+            settings_rows.append(f"**Playoffs:** weeks {playoff_weeks[0]}–{playoff_weeks[-1]}")
+        st.markdown("\n\n".join(settings_rows))
 
 synced_budget = int(current_data.get("budget", 100))
 faab_enabled = current_data.get("faab_enabled", True)
 with st.sidebar.expander("💰 FAAB Budget", expanded=True):
     if not faab_enabled:
         st.caption("This league doesn't use FAAB — bids are shown for reference only.")
-    budget = st.number_input("Remaining Budget ($)", min_value=0, max_value=10000, value=synced_budget, step=1)
-    if budget != synced_budget and selected_league and st.button("Save Budget"):
-        save_league({**current_data, "budget": int(budget)}, selected_league)
-        st.rerun()
+    budget = st.number_input("Remaining Budget ($)", min_value=0, max_value=10000, value=synced_budget, step=1,
+                             key=f"budget_{selected_league}",
+                             help="Synced from Sleeper. Change it to test bids; it isn't saved.")
 
 
 # ── Per-player helpers ────────────────────────────────────────────────────────
@@ -323,16 +404,41 @@ tab_roster, tab_waivers, tab_start_sit, tab_trade, tab_roster_mgmt = st.tabs(
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — ROSTER
 # ════════════════════════════════════════════════════════════════════════════
+_SLOT_ORDER = {slot: i for i, slot in enumerate(dict.fromkeys(
+    [s for s in roster_positions if s not in ("BN", "IR", "TAXI")] + ["BN", "IR", "Taxi"]))}
+
 with tab_roster:
-    st.subheader("Your Roster")
+    st.subheader(current_data.get("team_name") or "Your Roster")
     if not roster:
         st.info("Sync a league from the sidebar.")
     else:
+        mu = current_data.get("matchup")
+        if mu and mu.get("bye"):
+            st.caption(f"Week {mu['week']}: bye")
+        elif mu and mu.get("opponent"):
+            opp_rec = mu.get("opponent_record") or {}
+            opp_rec_str = f" ({opp_rec.get('wins', 0)}-{opp_rec.get('losses', 0)})" if opp_rec else ""
+            mc1, mc2, mc3 = st.columns([1, 1, 2])
+            mc1.metric(f"Week {mu['week']} — You", f"{mu['points']:g}")
+            mc2.metric(f"{mu['opponent']}{opp_rec_str}", f"{mu['opponent_points']:g}")
+            mc3.caption("Live points from Sleeper as of the last sync.")
+
+        has_slots = any(p.get("slot") for p in roster)
+        flagged = [p["name"] for p in roster
+                   if p.get("slot") not in (None, "BN", "IR", "Taxi") and is_inactive(inj_for(p))]
+        if flagged:
+            st.error(f"🚨 Starting an inactive player: {', '.join(flagged)} — swap them out in Sleeper.")
+        n_starting = len([s for s in roster_positions if s not in ("BN", "IR", "TAXI")])
+        n_started = len([p for p in roster if p.get("slot") not in (None, "BN", "IR", "Taxi")])
+        if has_slots and n_started < n_starting:
+            st.warning(f"⚠️ {n_starting - n_started} empty starting slot(s) in your Sleeper lineup.")
+
         rows = []
-        for p in roster:
+        for p in sorted(roster, key=lambda p: _SLOT_ORDER.get(p.get("slot"), len(_SLOT_ORDER))):
             s = roster_stats[p["name"]]
             next_g, m = matchup_for(p)
             rows.append({
+                **({"Slot": p.get("slot", "")} if has_slots else {}),
                 "Player": p["name"], "Pos": p.get("position", ""), "Team": p.get("team", ""),
                 "Season PPG": s["season"]["ppg"], "Recent PPG": s["recent"]["ppg"],
                 "Games": s["season"]["games"],
@@ -746,7 +852,7 @@ with tab_roster_mgmt:
         avail_stats = {p["name"]: stats_for(p) for p in avail_pool}
         avail_mults = {p["name"]: matchup_for(p)[1]["multiplier"] for p in avail_pool}
         analysis = analyze_roster_construction(roster, avail_pool, roster_stats, avail_stats,
-                                               _repl_levels, avail_mults)
+                                               _repl_levels, avail_mults, roster_positions)
 
         pg = analysis["position_grades"]
         weaknesses = analysis["weaknesses"]
@@ -756,8 +862,8 @@ with tab_roster_mgmt:
         for col, (pos, g) in zip(grade_cols, pg.items()):
             col.metric(pos, f"Grade {g['grade']}", f"×{g['strength_ratio']:.2f} vs replacement")
             col.caption(f"{g['depth_count']} players · starters avg {g['avg_starter_val']:.1f} adj pts")
-        if "DEF" in pg:
-            st.caption("DEF grades use a fixed replacement level — team defense stats aren't in the nflverse data.")
+        st.caption("Graded positions follow this league's lineup slots. DEF isn't graded — "
+                   "team defense stats aren't in the nflverse data.")
 
         if weaknesses:
             st.warning(f"⚠️ Positional weaknesses: **{', '.join(weaknesses)}** — prioritized in recommendations below")

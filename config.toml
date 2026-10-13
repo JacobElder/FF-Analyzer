@@ -1,0 +1,11 @@
+# Leagues loaded by default and kept in sync with Sleeper automatically.
+# Each value can be overridden in .env (SLEEPER_USERNAME, SLEEPER_LEAGUE_IDS, SLEEPER_AUTO_SYNC_MINUTES).
+
+[sleeper]
+username = "JElder52"
+league_ids = [
+    "1391496495336808448",  # (20 hppr) Google OKRs 2026
+    "1389377870526177280",  # The Catalina Wine Mixer
+]
+# Re-sync a league from Sleeper when its saved data is older than this
+auto_sync_minutes = 30

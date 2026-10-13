@@ -9,25 +9,38 @@ Optional Claude or Gemini narratives summarize the numbers.
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # optional: AI keys, Odds API key, Sleeper defaults
+cp .env.example .env        # optional: AI keys, Odds API key
 streamlit run app.py
 ```
 
-In the sidebar, open **➕ Sync from Sleeper** and enter your Sleeper username and league **name** (or the current
-season's league ID). The name always finds this season's league; Sleeper issues a new ID every season.
+Your leagues are listed in `config.toml`:
+
+```toml
+[sleeper]
+username = "JElder52"
+league_ids = ["1391496495336808448", "1389377870526177280"]
+auto_sync_minutes = 30
+```
+
+On load, the app syncs each listed league from Sleeper whenever its saved copy is older than
+`auto_sync_minutes`. A sync pulls your roster and current lineup slots, team name, record, this week's matchup,
+remaining FAAB, scoring, lineup settings and the waiver pool. If Sleeper is unreachable, the last saved copy is used
+and the sidebar says so. **🔄 Sync this league now** forces an update. To track another league once, use
+**➕ Add another Sleeper league**; to keep it synced, add its ID to `config.toml`. Sleeper issues new league IDs each
+season, so update the IDs when a new season starts.
 
 ## What each tab does
 
 | Tab | What you get |
 |---|---|
-| 📋 Roster | Season/recent PPG, games, injury status and next matchup for every rostered player. Players with no stats this season are flagged instead of silently showing 0. |
+| 📋 Roster | This week's matchup score, then every player in your Sleeper lineup order (slot, season/recent PPG, injury, next opponent). It flags injured starters and empty lineup slots, and marks players with no stats this season instead of showing 0. |
 | 🔄 Waivers | The full unrostered pool (sortable, filterable, injured players hidden by default). The deep dive gives a 0–100 value score, a FAAB bid from your remaining budget, a drop candidate, matchup/weather/usage/Vegas context and a Monte Carlo outcome distribution. |
 | ⚖️ Who to Start | Compare 2–4 roster players on projected points: value × this week's opponent-defense multiplier × injury factor (an Out player is never recommended). |
 | 🤝 Trade | Pick players to give from your roster and players to receive from any NFL team. The verdict comes from your **best starting lineup before vs. after**, so a 2-for-1 is judged by who would actually start. Per-player value over replacement and playoff-week schedule strength are also shown. |
-| 🏗️ Roster Construction | Position grades against league-specific replacement levels, plus waiver targets boosted where you're weak. |
+| 🏗️ Roster Construction | Grades for the positions your league's lineup actually uses, measured against league-specific replacement levels, plus waiver targets boosted where you're weak. |
 
-**🔄 Refresh data** in the sidebar re-downloads everything (stats, schedule, Sleeper players/injuries, odds).
-The sidebar warns when your sync is more than 2 days old: the waiver pool is a snapshot and won't drop players other managers have claimed until you re-sync.
+The sidebar shows your team, record and a **📜 League Settings** summary (teams, lineup, scoring, waivers, playoff
+weeks). **🔄 Refresh data** re-downloads the NFL stats, schedule, Sleeper player/injury data and odds.
 
 ## How the numbers are built
 
@@ -53,7 +66,7 @@ The sidebar warns when your sync is more than 2 days old: the waiver pool is a s
 | `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` | Enables AI narratives (either one). |
 | `CLAUDE_MODEL` / `GEMINI_MODEL` | Override model IDs (defaults: `claude-sonnet-5-5`, `gemini-2.5-flash`). |
 | `ODDS_API_KEY` | Vegas implied team totals ([the-odds-api.com](https://the-odds-api.com), free tier). |
-| `SLEEPER_USERNAME` / `SLEEPER_LEAGUE` | Pre-fill the sync form. |
+| `SLEEPER_USERNAME` / `SLEEPER_LEAGUE_IDS` / `SLEEPER_AUTO_SYNC_MINUTES` | Override `config.toml` (IDs comma-separated). |
 
 ## Project layout
 
@@ -63,7 +76,9 @@ src/
   scoring.py               League scoring → fantasy points (vectorized)
   wrangler.py              nflverse stats download + per-player StatsIndex
   players.py               Name/team normalization, Sleeper ↔ nflverse ID linking
-  sleeper_integration.py   League sync, FAAB budget, waiver pool, shared player DB
+  config.py                config.toml + .env settings
+  league_sync.py           Auto-sync of the configured leagues
+  sleeper_integration.py   League sync (lineup slots, record, matchup, FAAB, waiver pool), shared player DB
   evaluator.py             Value model, waiver scores, start/sit, lineup-based trades, roster grades
   simulator.py             Monte Carlo simulations
   defense.py               Points allowed by defense × position
@@ -75,7 +90,8 @@ src/
 tests/                     pytest suite (python -m pytest)
 ```
 
-Caches live in `data/` and league files in `leagues/`. Both are plain files, and you can delete `data/` at any time.
+Caches live in `data/` and synced league files in `leagues/`. Neither is committed to git, and both are rebuilt
+automatically if you delete them.
 
 ## Not yet implemented
 
