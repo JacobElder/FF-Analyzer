@@ -5,7 +5,7 @@ lineup gain, best drop, value to you, rival interest, win curve and bid.
 
 from src.evaluator import DEFAULT_ROSTER_POSITIONS
 from src.market import (
-    bid_profile, market_price_pct, max_bid, recommend_bid, rival_interest, typical_gain, win_curve,
+    bid_profile, market_price_pct, max_bid, plan_claims, recommend_bid, rival_interest, typical_gain, win_curve,
 )
 from src.valuation import evaluate_add, lineup_totals, roster_limit
 
@@ -68,6 +68,7 @@ def analyze_waiver_pool(roster: list, waivers: list, ctx, league: dict, players_
             "promotion": ctx.promotion_note(w),
             "return_week": ctx.return_week(w),
             "max_pay": max_pay,
+            "min_bid": min_bid,
             "suggested_bid": rec["suggested"],
             "p_win": rec["p_win"] if rec["p_win"] is not None else 0.5,
             "p_win_known": rec["p_win"] is not None,
@@ -88,3 +89,20 @@ def analyze_waiver_pool(roster: list, waivers: list, ctx, league: dict, players_
         "open_spots": max(0, roster_limit(positions) - len(eligible)),
         "weeks_left": weeks_left,
     }
+
+
+def build_claim_plan(analysis: dict, roster: list, ctx, budget: int, roster_positions: list | None = None,
+                     max_claims: int = 5) -> list:
+    """
+    This week's claims in priority order. Each later claim is re-valued against
+    the roster as it would be if the earlier claims (and their drops) went through.
+    """
+    positions = roster_positions or DEFAULT_ROSTER_POSITIONS
+
+    def reevaluate(c, plan_so_far):
+        dropped = {p["drop_name"] for p in plan_so_far if p["drop_name"]}
+        added = [{**p, "slot": "BN"} for p in plan_so_far]
+        new_roster = [p for p in roster if p["name"] not in dropped] + added
+        return evaluate_add(c, new_roster, ctx, positions)["drop_options"]
+
+    return plan_claims(analysis["candidates"], budget, analysis["open_spots"], max_claims, reevaluate=reevaluate)

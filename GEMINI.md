@@ -18,6 +18,10 @@ Streamlit dashboard for Sleeper fantasy football leagues. See README.md for feat
   Default leagues come from `config.toml` and are refreshed by `src/league_sync.py` when older than
   `auto_sync_minutes`.
 
+- Waiver/FAAB engine: `projections.py` → `valuation.py` (ValuationContext.week_values is the single source of
+  weekly player values) → `market.py` → `waiver_analysis.py`. In the app, `load_context` / `load_waiver_engine`
+  cache it per league sync and budget.
+
 ## Conventions
 - Team abbreviations are Sleeper style (`LAR`, `JAX`, `WAS`); normalize external data with `norm_team()`.
 - Stats are regular season only; a player's games include 0-point games.

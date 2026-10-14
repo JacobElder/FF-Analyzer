@@ -258,21 +258,34 @@ def plan_claims(candidates: list, budget: int, open_spots: int = 0, max_claims: 
                      if (o["name"] is None and open_spots > 0)
                      or (o["name"] and o["name"] not in used_drops and o["name"] not in planned_adds)), None)
 
+    def reprice(c, gain):
+        """Bid and P(win) when the claim is worth only `gain` (after earlier claims)."""
+        if gain >= c["gain_total"] or not c.get("max_pay"):
+            return c["suggested_bid"], c["p_win"]
+        cond_max = int(c["max_pay"] * gain / c["gain_total"])
+        if not c.get("curve"):
+            return min(c["suggested_bid"], max(cond_max, c.get("min_bid", 0))), c["p_win"]
+        rec = recommend_bid(cond_max, c["curve"], c.get("min_bid", 0))
+        return rec["suggested"], rec["p_win"]
+
     while pool and len(plan) < max_claims:
         scored = []
         for c in pool:
-            if spent + c["suggested_bid"] > budget:
-                continue
             o = best_option(c)
-            if o and o["gain_total"] > 0:
-                scored.append((c["p_win"] * o["gain_total"], c, o))
+            if not o or o["gain_total"] <= 0:
+                continue
+            bid, p_win = reprice(c, o["gain_total"])
+            if spent + bid > budget:
+                continue
+            scored.append((p_win * o["gain_total"], c, o, bid, p_win))
         if not scored:
             break
-        ev, c, o = max(scored, key=lambda x: x[0])
+        ev, c, o, bid, p_win = max(scored, key=lambda x: x[0])
         pool.remove(c)
         plan.append({**c, "drop_name": o["name"], "gain_total": o["gain_total"],
+                     "standalone_gain": c["gain_total"], "suggested_bid": bid, "p_win": p_win,
                      "priority": len(plan) + 1, "expected_gain": round(ev, 1)})
-        spent += c["suggested_bid"]
+        spent += bid
         if o["name"] is None:
             open_spots -= 1
         else:
