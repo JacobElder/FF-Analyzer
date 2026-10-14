@@ -74,10 +74,15 @@ def compute_positional_scarcity(stats_index, counts: dict | None = None) -> dict
 
 # ── Core value model ─────────────────────────────────────────────────────────
 
+# Backtested on the 2025 season (python -m src.backtest): 35% weight on the last
+# 6 weeks beat the previous 65% / last-4-weeks blend at predicting the next 4 weeks.
+RECENT_WEIGHT = 0.35
+
+
 def _expected_pts(season_ppg: float, recent_ppg: float | None) -> float:
-    """Expected points: 65% recent form, 35% season baseline."""
+    """Expected points: RECENT_WEIGHT × recent form + the rest season baseline."""
     if season_ppg and recent_ppg is not None:
-        return 0.65 * recent_ppg + 0.35 * season_ppg
+        return RECENT_WEIGHT * recent_ppg + (1 - RECENT_WEIGHT) * season_ppg
     return (recent_ppg if recent_ppg is not None else season_ppg) or 0.0
 
 

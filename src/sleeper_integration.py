@@ -67,9 +67,12 @@ def get_nfl_state() -> dict:
     """Current NFL season/week per Sleeper (/state/nfl), falling back to the calendar."""
     state, _ = _get("/state/nfl")
     if state and state.get("season"):
-        return {"season": str(state["season"]), "week": state.get("display_week") or state.get("week")}
+        # "week" is the upcoming/in-progress week (the one waiver claims and lineups are for);
+        # Sleeper's display_week lags behind it until mid-week.
+        week = state.get("week") if state.get("season_type") == "regular" else None
+        return {"season": str(state["season"]), "week": week, "season_type": state.get("season_type")}
     from src.wrangler import current_nfl_season
-    return {"season": str(current_nfl_season()), "week": None}
+    return {"season": str(current_nfl_season()), "week": None, "season_type": None}
 
 
 def get_nfl_season() -> str:
@@ -164,10 +167,55 @@ def _current_matchup(league_id: str, week, my_roster: dict, rosters: list, team_
     return {
         "week": week,
         "points": round(mine.get("points") or 0, 2),
+        "starters": [pid for pid in mine.get("starters") or [] if pid and pid != "0"],
         "opponent": team_names.get(opp_roster.get("owner_id"), "Unknown") if opp else None,
+        "opponent_roster_id": opp.get("roster_id") if opp else None,
         "opponent_points": round(opp.get("points") or 0, 2) if opp else None,
+        "opponent_starters": [pid for pid in (opp or {}).get("starters") or [] if pid and pid != "0"],
         "opponent_record": _record(opp_roster) if opp_roster else None,
     }
+
+
+def _league_rosters(rosters: list, league: dict, team_names: dict) -> list:
+    """Compact view of every team: players, FAAB left, waiver order, record."""
+    out = []
+    for r in rosters:
+        reserve = r.get("reserve") or []
+        out.append({
+            "roster_id": r.get("roster_id"),
+            "owner_id": r.get("owner_id"),
+            "team_name": team_names.get(r.get("owner_id"), f"Team {r.get('roster_id')}"),
+            "players": list(dict.fromkeys((r.get("players") or []) + reserve + (r.get("taxi") or []))),
+            "reserve": reserve,
+            "faab_remaining": parse_faab_budget(league, r),
+            "record": _record(r),
+        })
+    return out
+
+
+def _transactions(league_id: str, through_week: int | None) -> list:
+    """Compact waiver / free-agent transactions for weeks 1..through_week."""
+    out = []
+    for wk in range(1, (through_week or 0) + 1):
+        txs, err = _get(f"/league/{league_id}/transactions/{wk}")
+        if err:
+            log.warning("Transactions for week %s unavailable: %s", wk, err)
+            continue
+        for t in txs or []:
+            if t.get("type") not in ("waiver", "free_agent"):
+                continue
+            out.append({
+                "week": t.get("leg", wk),
+                "type": t["type"],
+                "status": t.get("status"),
+                "bid": (t.get("settings") or {}).get("waiver_bid"),
+                "roster_id": (t.get("roster_ids") or [None])[0],
+                "adds": list((t.get("adds") or {}).keys()),
+                "drops": list((t.get("drops") or {}).keys()),
+                "note": (t.get("metadata") or {}).get("notes"),
+                "created": t.get("created"),
+            })
+    return out
 
 
 def _find_league(user_id: str, league_id_or_name: str):
@@ -254,7 +302,14 @@ def sync_sleeper_league(username: str, league_id_or_name: str):
         "total_rosters": league.get("total_rosters") or len(rosters),
         "playoff_week_start": settings.get("playoff_week_start"),
         "record": _record(my_roster),
+        "roster_id": my_roster.get("roster_id"),
         "matchup": _current_matchup(league_id, week, my_roster, rosters, team_names),
+        "last_result": _current_matchup(league_id, week - 1, my_roster, rosters, team_names) if week and week > 1 else None,
+        "league_rosters": _league_rosters(rosters, league, team_names),
+        "transactions": _transactions(league_id, week),
+        "waiver_settings": {k: settings.get(k) for k in
+                            ("waiver_type", "waiver_day_of_week", "waiver_clear_days", "waiver_bid_min", "daily_waivers")},
+        "playoff_teams": settings.get("playoff_teams"),
         "roster": roster,
         "waivers": build_waiver_pool(rosters, players_db, trend_map),
         "scoring_settings": league.get("scoring_settings", {}),

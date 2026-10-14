@@ -21,6 +21,7 @@ from src.storage import data_path, is_fresh, write_parquet_atomic
 log = logging.getLogger(__name__)
 
 CACHE_TTL = 86400  # 24 hours
+RECENT_WEEKS = 6   # "recent form" window; backtested (see src/backtest.py)
 NFLVERSE_WEEKLY_URL = "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{year}.parquet"
 
 
@@ -134,7 +135,7 @@ class StatsIndex:
             ids = [i for i in ids if self.by_id[i]["team"] == player["team"]] or ids
         return ids[0] if len(ids) == 1 else None
 
-    def get_player_stats(self, player, recent_weeks: int = 4) -> dict:
+    def get_player_stats(self, player, recent_weeks: int = RECENT_WEEKS) -> dict:
         pid = self.resolve(player)
         if not pid:
             return {k: (dict(v) if isinstance(v, dict) else list(v) if isinstance(v, list) else v)
