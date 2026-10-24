@@ -16,6 +16,7 @@ source = ["src", "."]   # "." picks up app.py, exercised by tests/test_app_smoke
 omit = ["tests/*"]
 
 [tool.coverage.report]
+exclude_also = ['if __name__ == "__main__":']
 show_missing = true
 skip_covered = false
-fail_under = 80
+fail_under = 100

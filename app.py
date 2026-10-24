@@ -79,9 +79,8 @@ def load_players_db():
 
 @st.cache_resource(ttl=6 * 3600, show_spinner="Scoring players for this league…")
 def load_analytics(scoring_items: tuple, num_teams: int, roster_positions: tuple):
-    df = load_weekly_stats()
-    if not df.empty:
-        df = df.assign(fp=compute_fantasy_points(df, dict(scoring_items)))
+    df = load_weekly_stats()  # never empty here: the app stops earlier without stats
+    df = df.assign(fp=compute_fantasy_points(df, dict(scoring_items)))
     index = StatsIndex(df)
     matchups = build_matchup_table(compute_defense_rankings(df))
     repl = compute_positional_scarcity(index, starter_counts(num_teams, list(roster_positions)))
@@ -259,7 +258,7 @@ if current_data:
     elif roster:
         st.sidebar.warning("Sync time unknown (older file). Sync to refresh the roster and waiver pool.")
     if err := _sync["errors"].get(selected_league):
-        st.sidebar.warning(f"Auto-sync failed: {err}. Showing the last saved data.")
+        st.sidebar.warning(f"Auto-sync failed: {err.rstrip('.')}. Showing the last saved data.")
 
     if current_data.get("league_id") and st.sidebar.button("🔄 Sync this league now"):
         with st.spinner("Syncing from Sleeper..."):
@@ -480,10 +479,10 @@ with tab_roster:
                 if lineup and lineup["swaps"]:
                     fixed_ids = [roster_by_name[s_["name"]].get("player_id")
                                  for s_ in lineup["optimal"]["starters"] if s_["name"]]
+                    # Always computable here: both starter lists are non-empty once fixes exist
                     fixed = matchup_projection(fixed_ids, mu.get("opponent_starters") or [], ctx, _players_db)
-                    if fixed:
-                        mc4.metric("Win chance with fixes below", f"{fixed['p_win']:.0%}",
-                                   f"{fixed['p_win'] - proj_mu['p_win']:+.0%}")
+                    mc4.metric("Win chance with fixes below", f"{fixed['p_win']:.0%}",
+                               f"{fixed['p_win'] - proj_mu['p_win']:+.0%}")
                 st.caption(f"Projections for both starting lineups as set in Sleeper at the last sync. "
                            f"Suggested start/sit style this week: **{risk_mode(proj_mu['p_win'])}** "
                            "(favorites should cut variance, underdogs should chase upside).")
@@ -1132,10 +1131,10 @@ with tab_trade:
 
         bar_rows = ([{"Side": "Give", "Player": n, "Adj Value": v["adj_value"]} for n, v in trade["you_give"].items()]
                     + [{"Side": "Receive", "Player": n, "Adj Value": v["adj_value"]} for n, v in trade["you_receive"].items()])
-        if bar_rows:
-            st.plotly_chart(px.bar(pd.DataFrame(bar_rows), x="Player", y="Adj Value", color="Side",
-                                   color_discrete_map={"Give": "firebrick", "Receive": "seagreen"},
-                                   title="Trade Value Comparison"), width="stretch")
+        # Never empty: the Analyze button is disabled until a player is picked on either side
+        st.plotly_chart(px.bar(pd.DataFrame(bar_rows), x="Player", y="Adj Value", color="Side",
+                               color_discrete_map={"Give": "firebrick", "Receive": "seagreen"},
+                               title="Trade Value Comparison"), width="stretch")
 
         st.plotly_chart(_raincloud_fig(rc, rc_title), width="stretch")
 
