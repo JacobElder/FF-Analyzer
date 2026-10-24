@@ -42,12 +42,6 @@ def test_vegas_uses_each_teams_earliest_game():
     assert totals["MIA"] == 19.0  # MIA's next game is still used even though BUF's was set earlier
 
 
-@pytest.fixture
-def leagues_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(sm, "LEAGUES_DIR", tmp_path)
-    return tmp_path
-
-
 def test_safe_key_blocks_path_traversal(leagues_dir):
     assert "/" not in sm.safe_key("../../etc/passwd") and ".." not in sm.safe_key("../../etc/passwd")
     key = sm.save_league({"team_name": "x"}, "../evil")

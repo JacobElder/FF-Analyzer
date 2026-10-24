@@ -14,6 +14,7 @@ from src.evaluator import (
     DEFAULT_ROSTER_POSITIONS, analyze_roster_construction, compute_positional_scarcity,
     injury_factor, player_value, recommend_drop, score_trade, score_waiver, starter_counts,
 )
+from src.formatting import fmt_age, grade_color, lineup_summary, verdict_color
 from src.injuries import build_injury_map, injury_status, is_inactive
 from src.league_sync import auto_sync, leagues_due, sync_age_seconds
 from src.market import (
@@ -238,23 +239,6 @@ if not _players_db:
 
 # ── Sidebar: team, sync status, league settings, budget ─────────────────────
 
-def _fmt_age(seconds: float) -> str:
-    if seconds < 3600:
-        return f"{max(1, round(seconds / 60))} min ago"
-    if seconds < 86400:
-        return f"{seconds / 3600:.0f}h ago"
-    return f"{seconds / 86400:.0f} days ago"
-
-
-def _lineup_summary(positions: list) -> str:
-    counts = {}
-    for pos in positions:
-        counts[pos] = counts.get(pos, 0) + 1
-    starting = [f"{n} {pos}" if n > 1 else pos for pos, n in counts.items() if pos not in ("BN", "IR", "TAXI")]
-    extras = [f"{counts[k]} {label}" for k, label in (("BN", "bench"), ("IR", "IR"), ("TAXI", "taxi")) if k in counts]
-    return ", ".join(starting) + (f" (+ {', '.join(extras)})" if extras else "")
-
-
 _NOTABLE_SCORING = [("rec", "Reception"), ("pass_td", "Pass TD"), ("pass_int", "Interception"),
                     ("fum_lost", "Fumble lost"), ("bonus_rec_te", "TE reception bonus"),
                     ("bonus_rec_rb", "RB reception bonus"), ("bonus_rec_wr", "WR reception bonus")]
@@ -269,7 +253,7 @@ if current_data:
     age = sync_age_seconds(current_data)
     if age is not None:
         auto = f" · auto-updates every {CONFIG['auto_sync_minutes']:g} min" if is_default else ""
-        st.sidebar.caption(f"Synced {_fmt_age(age)}{auto}")
+        st.sidebar.caption(f"Synced {fmt_age(age)}{auto}")
         if not is_default and age > STALE_SYNC_DAYS * 86400:
             st.sidebar.warning("Roster and waiver pool may be stale — sync to drop players already claimed.")
     elif roster:
@@ -296,7 +280,7 @@ if current_data:
 
     with st.sidebar.expander("📜 League Settings"):
         settings_rows = [f"**Teams:** {num_teams}",
-                         f"**Lineup:** {_lineup_summary(current_data.get('roster_positions') or DEFAULT_ROSTER_POSITIONS)}",
+                         f"**Lineup:** {lineup_summary(current_data.get('roster_positions') or DEFAULT_ROSTER_POSITIONS)}",
                          f"**Scoring:** {scoring_label(scoring)}"]
         settings_rows += [f"- {label}: {scoring[key]:+g}" for key, label in _NOTABLE_SCORING if scoring.get(key)]
         if current_data.get("faab_enabled", True):
@@ -391,12 +375,6 @@ def proj_now(p) -> float | None:
 
 # ── UI Helpers ────────────────────────────────────────────────────────────────
 
-def _verdict_color(v: str) -> str:
-    return {"STRONG ADD": "green", "ADD": "green", "STREAM": "orange", "AVOID": "red",
-            "ACCEPT": "green", "NEGOTIATE": "orange", "DECLINE": "red"}.get(v, "gray")
-
-def _grade_color(grade: str) -> str:
-    return {"A": "green", "B": "blue", "C": "orange", "D": "red", "F": "red"}.get(grade, "gray")
 
 def _score_gauge(score: float, label: str = "Value Score"):
     fig = go.Figure(go.Indicator(
@@ -685,7 +663,7 @@ with tab_waivers:
                     st.markdown(f"### :{color}[{v}] for your roster")
                 else:
                     v = ws["verdict"]
-                    st.markdown(f"### :{_verdict_color(v)}[{v}]")
+                    st.markdown(f"### :{verdict_color(v)}[{v}]")
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Expected Pts/Wk", ws["expected_pts"])
                 m2.metric("Consistency", f"{ws['consistency_pct']:.0f}%")
@@ -1127,7 +1105,7 @@ with tab_trade:
             headline = f"Value over replacement {trade['delta']:+.1f} pts/wk · P(receive side wins) = {round(p_better * 100)}%"
 
         verdict = trade["verdict"]
-        st.markdown(f"## :{_verdict_color(verdict)}[{verdict}]  — {headline}")
+        st.markdown(f"## :{verdict_color(verdict)}[{verdict}]  — {headline}")
         st.caption("Verdict is based on your best possible starting lineup before vs. after the trade, so "
                    "bench depth only counts if it would start. Value over replacement (VORP) is shown per player.")
 
@@ -1170,7 +1148,7 @@ with tab_trade:
                     for p in players:
                         pss = get_playoff_schedule_strength(p.get("team", ""), _schedules_df, _matchups,
                                                             p.get("position", ""), playoff_weeks)
-                        st.markdown(f"{p['name']}: :{_grade_color(pss['grade'])}[Grade {pss['grade']}] "
+                        st.markdown(f"{p['name']}: :{grade_color(pss['grade'])}[Grade {pss['grade']}] "
                                     f"(avg mult {pss['avg_multiplier']:.2f})")
                         for wk in pss["weeks"]:
                             st.caption(f"  Wk {wk['week']}: vs {wk['opponent']} — {wk['matchup']}")

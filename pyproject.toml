@@ -1,0 +1,17 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers -q"
+filterwarnings = [
+    # scipy's gamma fit warns on perfectly flat weekly scores; the simulator handles it
+    "ignore:divide by zero encountered in scalar divide:RuntimeWarning:scipy",
+    "ignore:invalid value encountered in scalar subtract:RuntimeWarning:scipy",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 80

@@ -3,12 +3,31 @@ App configuration: config.toml at the project root, overridable by environment
 variables (.env).
 """
 
+import logging
 import os
 import tomllib
 
 from src.storage import PROJECT_ROOT
 
 CONFIG_PATH = PROJECT_ROOT / "config.toml"
+DEFAULT_SYNC_MINUTES = 30.0
+
+log = logging.getLogger(__name__)
+
+
+def _sync_minutes(env_value, toml_value) -> float:
+    for raw in (env_value, toml_value):
+        if raw in (None, ""):
+            continue
+        try:
+            minutes = float(raw)
+        except (TypeError, ValueError):
+            log.warning("Ignoring invalid auto_sync_minutes %r", raw)
+            continue
+        if minutes > 0:
+            return minutes
+        log.warning("Ignoring non-positive auto_sync_minutes %r", raw)
+    return DEFAULT_SYNC_MINUTES
 
 
 def load_config(path=CONFIG_PATH) -> dict:
@@ -27,5 +46,6 @@ def load_config(path=CONFIG_PATH) -> dict:
     return {
         "username": os.getenv("SLEEPER_USERNAME") or sleeper.get("username", ""),
         "league_ids": league_ids,
-        "auto_sync_minutes": float(os.getenv("SLEEPER_AUTO_SYNC_MINUTES") or sleeper.get("auto_sync_minutes", 30)),
+        "auto_sync_minutes": _sync_minutes(os.getenv("SLEEPER_AUTO_SYNC_MINUTES"),
+                                           sleeper.get("auto_sync_minutes")),
     }

@@ -18,7 +18,13 @@ def sync_age_seconds(data: dict, now: float | None = None) -> float | None:
     if not synced_at:
         return None
     now = now if now is not None else time.time()
-    return now - datetime.fromisoformat(synced_at).astimezone(timezone.utc).timestamp()
+    try:
+        ts = datetime.fromisoformat(str(synced_at))
+    except ValueError:
+        return None  # unreadable timestamp: treat as never synced
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)  # we always write UTC
+    return now - ts.timestamp()
 
 
 def is_sync_due(data: dict, max_age_s: float, now: float | None = None) -> bool:
@@ -45,7 +51,10 @@ def auto_sync(username: str, league_ids: list, max_age_s: float, attempts: dict,
         return errors
     for lid in leagues_due(league_ids, max_age_s, attempts, now):
         attempts[lid] = now
-        data, err = sync_fn(username, lid)
+        try:
+            data, err = sync_fn(username, lid)
+        except Exception as e:  # one bad league must not stop the others
+            data, err = None, f"Sync failed: {e}"
         if data:
             save_league(data)
         else:

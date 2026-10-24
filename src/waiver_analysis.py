@@ -43,7 +43,10 @@ def analyze_waiver_pool(roster: list, waivers: list, ctx, league: dict, players_
                 market_price = market_pct * profile["budget_total"] * (1 + min(0.5, (w.get("trend_count") or 0) / 4000))
             curve = win_curve(rivals_view, my_pos, ceiling, seed_key=str(w.get("player_id") or w["name"]),
                               market_price=market_price)
-            rec = recommend_bid(max_pay, curve, min_bid)
+            rec = recommend_bid(max_pay, curve, min_bid, budget)
+        elif e["gain_total"] > 0 and budget < min_bid:
+            rec = {"suggested": 0, "p_win": None, "likely_needed": None, "contested": None,
+                   "note": "Not enough FAAB left for the league's minimum bid."}
         elif e["gain_total"] > 0:
             rec = {"suggested": min(max(min_bid, max_pay // 2), budget), "p_win": None, "likely_needed": None,
                    "contested": None, "note": "Rival interest not modeled for lower-ranked candidates."}

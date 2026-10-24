@@ -230,7 +230,7 @@ def _find_league(user_id: str, league_id_or_name: str):
         leagues, err = _get(f"/user/{user_id}/leagues/nfl/{s}")
         if err:
             return None, err, state
-        match = next((l for l in leagues or [] if l.get("name", "").lower() == league_id_or_name.lower()), None)
+        match = next((l for l in leagues or [] if (l.get("name") or "").lower() == league_id_or_name.lower()), None)
         if match:
             return match, None, state
     return None, f"Could not find a league named '{league_id_or_name}' in {season} or {int(season) - 1}.", state
@@ -253,7 +253,7 @@ def sync_sleeper_league(username: str, league_id_or_name: str):
     league_id = league["league_id"]
     rosters, err = _get(f"/league/{league_id}/rosters")
     if rosters is None:
-        return None, err
+        return None, err or "Sleeper returned no rosters for this league."
 
     my_roster = next(
         (r for r in rosters if r.get("owner_id") == user_id or user_id in (r.get("co_owners") or [])),
@@ -289,7 +289,9 @@ def sync_sleeper_league(username: str, league_id_or_name: str):
     data = {
         "league_id": league_id,
         "league_name": league.get("name", ""),
-        "team_name": team_names.get(user_id) or user.get("display_name") or username,
+        # The team's name belongs to its owner (co-owners share it), as for every other team
+        "team_name": team_names.get(my_roster.get("owner_id")) or team_names.get(user_id)
+                     or user.get("display_name") or username,
         "username": username,
         "season": league_season,
         "current_season": nfl_state["season"],

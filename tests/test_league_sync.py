@@ -8,12 +8,6 @@ from src.config import load_config
 from src.sleeper_integration import assign_slots
 
 
-@pytest.fixture(autouse=True)
-def leagues_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(sm, "LEAGUES_DIR", tmp_path)
-    return tmp_path
-
-
 def _iso(minutes_ago):
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat(timespec="seconds")
 

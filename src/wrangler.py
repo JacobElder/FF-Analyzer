@@ -89,6 +89,17 @@ _EMPTY_STATS = {
 _USAGE_COLS = ["target_share", "air_yards_share", "wopr", "racr"]
 
 
+_POSITION_GROUPS = {"FB": "RB", "HB": "RB"}
+
+
+def _same_position(indexed, wanted) -> bool:
+    """Positions match (FB/HB count as RB). A missing indexed position can't rule a match out."""
+    if not isinstance(indexed, str) or not indexed:
+        return True
+    norm = lambda p: _POSITION_GROUPS.get(p.upper(), p.upper())
+    return norm(indexed) == norm(str(wanted))
+
+
 class StatsIndex:
     """
     Pre-grouped per-player stats built once per (stats data, scoring) pair.
@@ -96,6 +107,9 @@ class StatsIndex:
     """
 
     def __init__(self, df: pd.DataFrame):
+        if not df.empty:
+            # Row lookups below are positional, and "latest team" means the last week
+            df = df.sort_values(["player_id", "week"], kind="stable").reset_index(drop=True)
         self.df = df
         self.season = int(df["season"].iloc[0]) if not df.empty and "season" in df.columns else None
         self.last_week = int(df["week"].max()) if not df.empty else 0
@@ -129,10 +143,14 @@ class StatsIndex:
         if gid and gid in self.by_id:
             return gid
         ids = self.by_name.get(normalize_name(player.get("name", "")), [])
-        if len(ids) > 1 and player.get("position"):
-            ids = [i for i in ids if self.by_id[i]["position"] == player["position"]] or ids
-        if len(ids) > 1 and player.get("team"):
-            ids = [i for i in ids if self.by_id[i]["team"] == player["team"]] or ids
+        pos, team = player.get("position"), player.get("team")
+        if pos:
+            # A name match at another position is a different person (WR vs CB namesakes)
+            ids = [i for i in ids if _same_position(self.by_id[i]["position"], pos)]
+        if len(ids) > 1 and team:
+            ids = [i for i in ids if self.by_id[i]["team"] == team] or ids
+        if gid and team and len(ids) == 1 and self.by_id[ids[0]]["team"] != team:
+            return None  # has its own ID that isn't in the stats, and the namesake plays elsewhere
         return ids[0] if len(ids) == 1 else None
 
     def get_player_stats(self, player, recent_weeks: int = RECENT_WEEKS) -> dict:

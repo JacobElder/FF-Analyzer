@@ -56,16 +56,18 @@ def parse_implied_totals(games: list) -> dict:
             continue  # already have both teams' next games
 
         total_val = home_spread = None
-        for bookmaker in game.get("bookmakers", [])[:1]:  # first bookmaker
+        for bookmaker in game.get("bookmakers", []):  # first bookmaker that has each market
             for market in bookmaker.get("markets", []):
-                if market.get("key") == "totals":
+                if market.get("key") == "totals" and total_val is None:
                     for o in market.get("outcomes", []):
                         if o.get("name") == "Over":
                             total_val = o.get("point")
-                elif market.get("key") == "spreads":
+                elif market.get("key") == "spreads" and home_spread is None:
                     for o in market.get("outcomes", []):
                         if o.get("name") == home:
                             home_spread = o.get("point")
+            if total_val is not None and home_spread is not None:
+                break
 
         if total_val is not None and home_spread is not None:
             totals.setdefault(home_abbr, round((total_val - home_spread) / 2, 1))
@@ -91,10 +93,19 @@ def fetch_implied_totals(force: bool = False) -> dict:
         )
         if resp.status_code != 200:
             log.warning("Odds API returned %s", resp.status_code)
-            return {}
+            return _stale(path)
         totals = parse_implied_totals(resp.json())
         write_json_atomic(totals, path)
         return totals
     except Exception as e:
-        log.warning("Vegas fetch failed: %s", e)
+        # Exception text can include the request URL, which carries the API key
+        log.warning("Vegas fetch failed: %s", str(e).replace(api_key, "***"))
+        return _stale(path)
+
+
+def _stale(path) -> dict:
+    """Last cached totals (even if old), or {} when there is none."""
+    try:
+        return read_json(path) if path.exists() else {}
+    except (OSError, ValueError):
         return {}

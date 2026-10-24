@@ -6,9 +6,12 @@ the leagues directory. Synced leagues are keyed by league_id, so re-syncing by
 name or by ID updates the same file. Reads never write.
 """
 
+import logging
 import re
 
 from src.storage import LEAGUES_DIR, read_json, write_json_atomic
+
+log = logging.getLogger(__name__)
 
 
 def safe_key(raw: str) -> str:
@@ -34,6 +37,8 @@ def list_leagues() -> list[tuple[str, str]]:
             data = read_json(path)
         except (OSError, ValueError):
             continue
+        if not isinstance(data, dict):
+            continue
         name = data.get("league_name") or data.get("team_name") or key
         season = data.get("season")
         label = f"{name} ({season})" if season else name
@@ -44,11 +49,24 @@ def list_leagues() -> list[tuple[str, str]]:
     return sorted(by_league.values(), key=lambda kv: kv[1].lower())
 
 
+def _empty_league(key: str) -> dict:
+    return {"team_name": key, "budget": 100, "roster": [], "waivers": []}
+
+
 def load_league(key: str) -> dict:
+    """Saved league data; an empty league if the file is missing or unreadable."""
     path = _path(key)
     if not path.exists():
-        return {"team_name": key, "budget": 100, "roster": [], "waivers": []}
-    return read_json(path)
+        return _empty_league(key)
+    try:
+        data = read_json(path)
+    except (OSError, ValueError) as e:
+        log.warning("Could not read league file %s: %s", path.name, e)
+        return _empty_league(key)
+    if not isinstance(data, dict):
+        log.warning("League file %s is not a JSON object; ignoring it", path.name)
+        return _empty_league(key)
+    return data
 
 
 def save_league(data: dict, key: str | None = None) -> str:
