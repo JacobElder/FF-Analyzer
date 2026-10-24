@@ -120,11 +120,23 @@ src/
   vegas.py                 Implied team totals
   state_manager.py         League files (leagues/<league_id>.json)
   storage.py               Cache paths and atomic file writes
-tests/                     pytest suite (python -m pytest)
+tests/                     pytest suite (see Testing below)
 ```
 
 Caches live in `data/` and synced league files in `leagues/`. Neither is committed to git, and both are rebuilt
 automatically if you delete them.
+
+## Testing
+
+```
+pip install -r requirements-dev.txt
+python -m pytest                                   # whole suite, offline
+python -m pytest -m "not app"                      # skip the slow Streamlit app tests
+python -m coverage run -m pytest && python -m coverage report   # src/ + app.py; fails below 100%
+```
+
+Tests never touch the network or your real `data/`, `leagues/` or `.env`: `tests/conftest.py` points the data
+directories at a temp folder, clears API-key and Sleeper env vars, and blocks sockets for every test.
 
 ## Not yet implemented
 

@@ -65,9 +65,11 @@ def effective_scoring(league_scoring: dict | None) -> dict:
     merged = dict(DEFAULT_SCORING)
     for k, v in (league_scoring or {}).items():
         try:
-            merged[k] = float(v)
+            f = float(v)
         except (TypeError, ValueError):
             continue
+        if f == f and abs(f) != float("inf"):  # skip NaN/inf, which would poison every score
+            merged[k] = f
     return merged
 
 

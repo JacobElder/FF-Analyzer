@@ -1,5 +1,9 @@
+import math
 import statistics
 from collections import Counter
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 # Static fallback replacement levels (PPG)
 POSITION_REPLACEMENT = {
@@ -91,7 +95,7 @@ def _consistency(weekly_pts: list, expected: float) -> float:
     0.0–1.0 consistency from the coefficient of variation over the last 8
     games (duds included). High consistency = low CV = closer to 1.0.
     """
-    pts = list(weekly_pts[-8:])
+    pts = [float(x) for x in weekly_pts[-8:] if x is not None and math.isfinite(float(x))]
     if len(pts) < 3 or expected <= 0:
         return 0.5  # neutral when not enough data
     cv = statistics.stdev(pts) / expected
@@ -211,16 +215,25 @@ def optimal_lineup(players: list, roster_positions: list | None = None) -> dict:
     slots = [s for s in (roster_positions or DEFAULT_ROSTER_POSITIONS) if s in SLOT_ELIGIBILITY]
     slots.sort(key=lambda s: len(SLOT_ELIGIBILITY[s]))
     pool = sorted(players, key=lambda p: p["value"], reverse=True)
-    used, starters = set(), []
 
-    for slot in slots:
-        eligible = SLOT_ELIGIBILITY[slot]
-        pick = next((i for i, p in enumerate(pool) if i not in used and p["position"] in eligible), None)
-        if pick is None:
+    # Exact max-value assignment. Greedy slot-by-slot filling is wrong when
+    # flex slots overlap without nesting (e.g. WRRB_FLEX + REC_FLEX).
+    assigned = {}
+    if slots and pool:
+        value = np.zeros((len(slots), len(pool)))
+        for i, slot in enumerate(slots):
+            for j, p in enumerate(pool):
+                if p["position"] in SLOT_ELIGIBILITY[slot]:
+                    value[i, j] = max(float(p["value"]), 0.0) + 1e-9  # epsilon: prefer filling a slot
+        rows, cols = linear_sum_assignment(value, maximize=True)
+        assigned = {i: j for i, j in zip(rows, cols) if value[i, j] > 0}
+
+    starters = []
+    for i, slot in enumerate(slots):
+        if i not in assigned:
             starters.append({"slot": slot, "name": None, "position": None, "value": 0.0})
             continue
-        used.add(pick)
-        p = pool[pick]
+        p = pool[assigned[i]]
         starters.append({"slot": slot, "name": p["name"], "position": p["position"], "value": p["value"]})
 
     return {"starters": starters, "total": round(sum(s["value"] for s in starters), 2)}
@@ -273,10 +286,15 @@ def score_trade(
 
     if roster_vals:
         before = optimal_lineup(roster_vals, roster_positions)
-        after_pool = [v for v in roster_vals if v["name"] not in give_set] + recv_vals
+        kept = [v for v in roster_vals if v["name"] not in give_set]
+        kept_names = {v["name"] for v in kept}
+        after_pool = kept + [v for v in recv_vals if v["name"] not in kept_names]  # never count a player twice
         after = optimal_lineup(after_pool, roster_positions)
         delta = after["total"] - before["total"]
-        delta_pct = delta / before["total"] if before["total"] > 0 else 0.0
+        if before["total"] > 0:
+            delta_pct = delta / before["total"]
+        else:  # empty or stat-less lineup: any gain is a clear improvement
+            delta_pct = 1.0 if delta > 0 else (-1.0 if delta < 0 else 0.0)
         result.update({
             "method": "lineup",
             "before": before, "after": after,
@@ -410,6 +428,9 @@ def recommend_drop(
       2. Weakest any-position player below replacement level
       3. Weakest same-position player (all above replacement)
       4. Weakest player overall (last resort)
+
+    Players with no stats (always DEF, sometimes K or rookies) can't be valued,
+    so they only count as below replacement when the add is at their position.
     """
     if not roster:
         return None
@@ -417,12 +438,15 @@ def recommend_drop(
     scored = []
     for p in roster:
         pos = p.get("position", "")
-        v = player_value(roster_stats.get(p["name"], {}))
+        stats = roster_stats.get(p["name"]) or {}
+        v = player_value(stats)
         scored.append({"name": p["name"], "position": pos, "adj_value": v["adj_value"],
-                       "surplus": round(v["adj_value"] - _replacement(pos, replacement_levels), 2)})
+                       "surplus": round(v["adj_value"] - _replacement(pos, replacement_levels), 2),
+                       "has_stats": bool(stats.get("found") or stats.get("season") or stats.get("weekly"))})
 
     same_pos = [p for p in scored if p["position"] == add_position]
-    below_repl = sorted([p for p in scored if p["surplus"] < 0], key=lambda x: x["adj_value"])
+    below_repl = sorted([p for p in scored if p["surplus"] < 0 and (p["has_stats"] or p["position"] == add_position)],
+                        key=lambda x: x["adj_value"])
     same_pos_below = [p for p in below_repl if p["position"] == add_position]
 
     if same_pos_below:
@@ -431,4 +455,5 @@ def recommend_drop(
         return {**below_repl[0], "reason": "Weakest below-replacement player on roster"}
     if same_pos:
         return {**min(same_pos, key=lambda x: x["adj_value"]), "reason": f"Weakest {add_position} (all above replacement)"}
-    return {**min(scored, key=lambda x: x["adj_value"]), "reason": "Weakest player on roster"}
+    valued = [p for p in scored if p["has_stats"]] or scored
+    return {**min(valued, key=lambda x: x["adj_value"]), "reason": "Weakest player on roster"}

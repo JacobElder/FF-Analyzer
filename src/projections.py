@@ -27,7 +27,8 @@ _POINT_KEYS = ("pts_std", "pts_half_ppr", "pts_ppr")
 def fetch_week_projections(season: int, week: int, completed: bool = False, force: bool = False) -> dict:
     """
     {sleeper_player_id: projected stat dict} for one week, file-cached.
-    Only players with a non-zero projection are kept.
+    Players Sleeper explicitly projects at 0 are kept (that is information:
+    usually inactive or a backup); rows with no point totals at all are dropped.
     """
     path = data_path(f"projections_{season}_{week}.json")
     if not force and is_fresh(path, PAST_TTL if completed else CURRENT_TTL):
@@ -39,7 +40,7 @@ def fetch_week_projections(season: int, week: int, completed: bool = False, forc
         out = {}
         for row in r.json():
             stats = row.get("stats") or {}
-            if any(stats.get(k) for k in _POINT_KEYS) and row.get("player_id"):
+            if any(isinstance(stats.get(k), (int, float)) for k in _POINT_KEYS) and row.get("player_id"):
                 out[row["player_id"]] = stats
         write_json_atomic(out, path)
         return out

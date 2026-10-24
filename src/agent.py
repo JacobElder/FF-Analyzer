@@ -30,13 +30,12 @@ SYSTEM_PROMPT = (
 
 
 def _fmt_context(context: dict | None) -> str:
-    if not context:
-        return "  (no additional context)"
-    return "\n".join(f"  {k}: {v}" for k, v in context.items() if v not in (None, "", []))
+    lines = [f"  {k}: {v}" for k, v in (context or {}).items() if v not in (None, "", [])]
+    return "\n".join(lines) if lines else "  (no additional context)"
 
 
 def _fmt_stats(stats: dict, last_n: int = 6) -> str:
-    if not stats or not stats.get("found", True) and not stats.get("weekly"):
+    if not stats or (not stats.get("found", True) and not stats.get("weekly")):
         return "  No stats found for this season."
     s = stats.get("season") or {}
     r = stats.get("recent") or {}
@@ -53,7 +52,9 @@ class FantasyAgent:
         self.provider = provider
 
     def analyze(self, prompt: str) -> str:
-        key_name = _KEY_ENV.get(self.provider, "ANTHROPIC_API_KEY")
+        key_name = _KEY_ENV.get(self.provider)
+        if key_name is None:
+            return f"⚠️ **Unknown AI provider:** {self.provider!r}. Use 'claude' or 'gemini'."
         api_key = os.getenv(key_name)
         if not api_key:
             return f"⚠️ **API key not configured.** Add `{key_name}` to your `.env` file."

@@ -19,8 +19,10 @@ def build_injury_map(players_db: dict) -> dict:
         if p_info.get("position") not in RELEVANT_POSITIONS:
             continue
         key = normalize_name(sleeper_display_name(p_info))
-        name_counts[key] = name_counts.get(key, 0) + 1
         status = p_info.get("injury_status")
+        if p_info.get("active") is False and not status:
+            continue  # a retired namesake shouldn't make an active player's name ambiguous
+        name_counts[key] = name_counts.get(key, 0) + 1
         if status and status != "NA":
             by_id[p_id] = status
             by_name[key] = status

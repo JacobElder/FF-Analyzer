@@ -7,3 +7,8 @@ data/
 
 # League data is re-synced from Sleeper automatically
 leagues/*.json
+
+# Test artifacts
+.coverage
+htmlcov/
+.pytest_cache/

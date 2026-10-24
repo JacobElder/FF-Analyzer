@@ -6,6 +6,7 @@ directory), and every write goes to a temp file first and is then renamed
 into place, so a crash or concurrent rerun never leaves a half-written cache.
 """
 
+import contextlib
 import json
 import os
 import tempfile
@@ -44,7 +45,7 @@ def _atomic_write(path: Path, write_fn, mode: str) -> None:
         os.chmod(tmp, 0o666 & ~_UMASK)  # mkstemp creates 0600; match normal file permissions
         os.replace(tmp, path)
     except BaseException:
-        if os.path.exists(tmp):
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
         raise
 

@@ -12,6 +12,7 @@ An add is worth what it does to your *best starting lineup* in each remaining
 week through the end of the fantasy playoffs, net of the player you drop.
 """
 
+import math
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -41,6 +42,17 @@ STREAM_HORIZON = 2
 # the starter's production the backup inherits when he does.
 STARTER_MISS_RATE = 0.06
 HANDCUFF_SHARE = 0.65
+
+
+def _finite(x):
+    """x as a float, or None when missing or NaN/inf (bad upstream data)."""
+    if x is None:
+        return None
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
 
 
 def team_week_opponents(schedules_df: pd.DataFrame) -> dict:
@@ -131,8 +143,8 @@ class ValuationContext:
             if self.current_week is not None and w < self.current_week + out_weeks:
                 values[w] = 0.0  # still injured (estimate)
                 continue
-            proj = self.projections.get(p.get("player_id"), w) if self.projections else None
-            hist = self._history_value(p, stats, w)
+            proj = _finite(self.projections.get(p.get("player_id"), w) if self.projections else None)
+            hist = _finite(self._history_value(p, stats, w))
             if proj is not None and hist is not None:
                 v = PROJECTION_WEIGHT * proj + (1 - PROJECTION_WEIGHT) * hist
             elif proj is not None:

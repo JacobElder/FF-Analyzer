@@ -27,6 +27,7 @@ def _seed(key: str, weekly: list) -> int:
 
 def _fit_samples(weekly_pts: list, fallback_mean: float, rng: np.random.Generator) -> np.ndarray:
     pts = np.asarray(weekly_pts, dtype=float)
+    pts = pts[np.isfinite(pts)]
     positive = pts[pts > 0]
 
     if len(pts) >= 4 and len(positive) >= 4:
@@ -41,8 +42,9 @@ def _fit_samples(weekly_pts: list, fallback_mean: float, rng: np.random.Generato
         except Exception:
             pass
 
-    # Fallback: Normal from available data, or from the expected value
-    mean = float(np.mean(pts)) if len(pts) >= 2 else (fallback_mean or 10.0)
+    # Fallback: Normal from available data, or from the expected value.
+    # No data at all means 0 — the same value the evaluator gives an unknown player.
+    mean = float(np.mean(pts)) if len(pts) >= 2 else float(fallback_mean or 0.0)
     std = float(np.std(pts)) if len(pts) >= 2 else mean * 0.5
     std = max(std, 1.0)  # prevent degenerate distribution
     return np.clip(rng.normal(mean, std, N_SAMPLES), 0, None)
@@ -67,7 +69,7 @@ def simulate_player(stats: dict, key: str = "", multiplier: float = 1.0) -> np.n
     """
     weekly = stats.get("weekly") or []
     recent = (stats.get("recent") or {}).get("ppg")
-    fallback = recent if recent is not None else ((stats.get("season") or {}).get("ppg") or 10.0)
+    fallback = recent if recent is not None else ((stats.get("season") or {}).get("ppg") or 0.0)
     rng = np.random.default_rng(_seed(key, weekly))
     return _fit_samples(weekly, fallback, rng) * multiplier
 
@@ -95,15 +97,20 @@ def simulate_start_sit(p1_name: str, p1_stats: dict, p2_name: str, p2_stats: dic
     }
 
 
+def win_shares(sample_sets: list) -> list:
+    """P(each set scores the most); a tied top score is shared equally, not given to the first."""
+    arr = np.array(sample_sets)
+    top = arr == arr.max(axis=0)
+    return [float(x) for x in (top / top.sum(axis=0)).mean(axis=1)]
+
+
 def simulate_multi_start(named_stats: dict, multipliers: dict | None = None) -> dict:
     """Multi-player (2–4): probability each player scores the most, plus intervals."""
     m = multipliers or {}
     names = list(named_stats.keys())
     samples = {n: simulate_player(s, n, m.get(n, 1.0)) for n, s in named_stats.items()}
-    arr = np.array([samples[n] for n in names])
-    winners = np.argmax(arr, axis=0)
-
-    win_probs = {names[i]: round(float(np.mean(winners == i)), 3) for i in range(len(names))}
+    shares = win_shares([samples[n] for n in names])
+    win_probs = {n: round(shares[i], 3) for i, n in enumerate(names)}
     return {
         "best": max(win_probs, key=win_probs.get),
         "win_probs": win_probs,

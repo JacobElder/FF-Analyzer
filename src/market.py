@@ -106,9 +106,11 @@ def max_bid(gain_total: float, typical: float, budget: float, weeks_left: int) -
     still make (one every two weeks), scaled by how this add compares with a
     typical one. Late in the season fewer claims remain, so each is worth more.
     """
-    if gain_total <= 0 or budget <= 0:
+    if not math.isfinite(gain_total) or gain_total <= 0 or budget <= 0:
         return 0
     future_claims = max(1.0, weeks_left / 2 * CLAIMS_PER_TWO_WEEKS)
+    if not math.isfinite(typical) or typical <= 0:
+        typical = gain_total  # no reference add: value this one as a typical claim
     share = gain_total / (typical * future_claims)
     return int(min(budget, round(budget * share)))
 
@@ -214,10 +216,16 @@ def win_curve(rivals: list, my_waiver_position, max_level: int, seed_key: str = 
     return curve
 
 
-def recommend_bid(max_pay: int, curve: list, min_bid: int = 0) -> dict:
-    """Cheapest bid reaching TARGET_WIN_PROB, capped at max_pay."""
+def recommend_bid(max_pay: int, curve: list, min_bid: int = 0, budget: int | None = None) -> dict:
+    """
+    Cheapest bid reaching TARGET_WIN_PROB, capped at max_pay. Never suggests
+    more than `budget`, and never a non-zero bid for a player worth $0 to you.
+    """
     p_at = dict(curve)
     contested = any(p < 1.0 for _, p in curve)
+    if budget is not None and budget < min_bid:
+        return {"suggested": 0, "p_win": 0.0, "likely_needed": None, "contested": contested,
+                "note": "Not enough FAAB left for the league's minimum bid."}
     if not contested:
         return {"suggested": min_bid, "p_win": 1.0, "likely_needed": min_bid, "contested": False,
                 "note": "No other team gains much from him — a minimum bid should do."}
@@ -225,10 +233,13 @@ def recommend_bid(max_pay: int, curve: list, min_bid: int = 0) -> dict:
     target = next((b for b, p in curve if p >= TARGET_WIN_PROB), None)
     if target is not None and target <= max_pay:
         bid, note = max(target, min_bid), f"Cheapest bid with a {TARGET_WIN_PROB:.0%}+ chance to win."
+    elif max_pay <= 0:
+        bid, note = 0, "Not worth a bid for your roster."
     else:
         bid = max(min(max_pay, curve[-1][0]), min_bid)
-        note = ("Winning likely costs more than he's worth to you — bid your max only if you want a shot."
-                if max_pay > 0 else "Not worth a bid for your roster.")
+        note = "Winning likely costs more than he's worth to you — bid your max only if you want a shot."
+    if budget is not None:
+        bid = min(bid, budget)
     return {"suggested": int(bid), "p_win": p_at.get(bid, 0.0), "likely_needed": likely,
             "contested": True, "note": note}
 
@@ -265,7 +276,7 @@ def plan_claims(candidates: list, budget: int, open_spots: int = 0, max_claims: 
         cond_max = int(c["max_pay"] * gain / c["gain_total"])
         if not c.get("curve"):
             return min(c["suggested_bid"], max(cond_max, c.get("min_bid", 0))), c["p_win"]
-        rec = recommend_bid(cond_max, c["curve"], c.get("min_bid", 0))
+        rec = recommend_bid(cond_max, c["curve"], c.get("min_bid", 0), budget)
         return rec["suggested"], rec["p_win"]
 
     while pool and len(plan) < max_claims:
@@ -326,8 +337,10 @@ def faab_log(transactions: list, my_roster_id, index, players_db: dict) -> list:
 # ── Standings and this week's matchup ────────────────────────────────────────
 
 def standings(league_rosters: list) -> list:
-    rows = sorted(league_rosters, key=lambda r: (-(r["record"]["wins"] + 0.5 * r["record"].get("ties", 0)),
-                                                 -r["record"]["points_for"]))
+    def key(r):
+        rec = r.get("record") or {}
+        return (-((rec.get("wins") or 0) + 0.5 * (rec.get("ties") or 0)), -(rec.get("points_for") or 0))
+    rows = sorted(league_rosters, key=key)
     return [{"rank": i + 1, **r} for i, r in enumerate(rows)]
 
 
