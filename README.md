@@ -131,7 +131,8 @@ automatically if you delete them.
 ```
 pip install -r requirements-dev.txt
 python -m pytest                                   # whole suite, offline
-python -m coverage run -m pytest && python -m coverage report   # fails under 80% branch coverage
+python -m pytest -m "not app"                      # skip the slow Streamlit app tests
+python -m coverage run -m pytest && python -m coverage report   # src/ + app.py; fails under 80%
 ```
 
 Tests never touch the network or your real `data/`, `leagues/` or `.env`: `tests/conftest.py` points the data

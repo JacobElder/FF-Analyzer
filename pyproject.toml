@@ -1,6 +1,9 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers -q"
+markers = [
+    "app: runs the full Streamlit app (slow); skip with -m 'not app'",
+]
 filterwarnings = [
     # scipy's gamma fit warns on perfectly flat weekly scores; the simulator handles it
     "ignore:divide by zero encountered in scalar divide:RuntimeWarning:scipy",
@@ -9,7 +12,8 @@ filterwarnings = [
 
 [tool.coverage.run]
 branch = true
-source = ["src"]
+source = ["src", "."]   # "." picks up app.py, exercised by tests/test_app_smoke.py
+omit = ["tests/*"]
 
 [tool.coverage.report]
 show_missing = true

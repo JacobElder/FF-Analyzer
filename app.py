@@ -26,7 +26,7 @@ from src.schedule import (
 )
 from src.scoring import compute_fantasy_points, effective_scoring, scoring_key, scoring_label
 from src.simulator import (
-    _summary, simulate_lineup_change, simulate_player, simulate_trade,
+    _summary, simulate_lineup_change, simulate_player, simulate_trade, win_shares,
 )
 from src.sleeper_integration import fetch_all_players, players_db_age_seconds, sync_sleeper_league
 from src.state_manager import list_leagues, load_league, save_league
@@ -970,8 +970,8 @@ with tab_start_sit:
             metric_key = {"Safe": "floor", "Balanced": "mean", "Upside": "ceiling"}[style]
             score = {n: (projected[n] if metric_key == "mean" else summaries[n][metric_key]) for n in selected_players}
             order = sorted(selected_players, key=lambda n: -score[n])
-            winners = np.argmax(np.array([samples[n] for n in selected_players]), axis=0)
-            win_probs = {n: float(np.mean(winners == i)) for i, n in enumerate(selected_players)}
+            shares = win_shares([samples[n] for n in selected_players])
+            win_probs = dict(zip(selected_players, shares))
             ranked = [{"name": n, "rank": i + 1, "start_value": projected[n], "injury": injuries[n],
                        "consistency": player_value(named_stats[n])["consistency"]} for i, n in enumerate(order)]
             mc_result = {"win_probs": win_probs, "summaries": summaries, "samples": {n: samples[n] for n in order}}

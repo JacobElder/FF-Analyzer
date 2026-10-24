@@ -97,17 +97,20 @@ def simulate_start_sit(p1_name: str, p1_stats: dict, p2_name: str, p2_stats: dic
     }
 
 
+def win_shares(sample_sets: list) -> list:
+    """P(each set scores the most); a tied top score is shared equally, not given to the first."""
+    arr = np.array(sample_sets)
+    top = arr == arr.max(axis=0)
+    return [float(x) for x in (top / top.sum(axis=0)).mean(axis=1)]
+
+
 def simulate_multi_start(named_stats: dict, multipliers: dict | None = None) -> dict:
     """Multi-player (2–4): probability each player scores the most, plus intervals."""
     m = multipliers or {}
     names = list(named_stats.keys())
     samples = {n: simulate_player(s, n, m.get(n, 1.0)) for n, s in named_stats.items()}
-    arr = np.array([samples[n] for n in names])
-    # Each sample's win is shared equally among everyone tied for the top score
-    top = arr == arr.max(axis=0)
-    share = top / top.sum(axis=0)
-
-    win_probs = {names[i]: round(float(share[i].mean()), 3) for i in range(len(names))}
+    shares = win_shares([samples[n] for n in names])
+    win_probs = {n: round(shares[i], 3) for i, n in enumerate(names)}
     return {
         "best": max(win_probs, key=win_probs.get),
         "win_probs": win_probs,
