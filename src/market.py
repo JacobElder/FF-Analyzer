@@ -34,6 +34,10 @@ AGGRESSION_PSEUDO_CLAIMS = 4 # shrink each manager's bidding style toward the le
 AGGRESSION_WEIGHT = 0.5      # how much the top interested rival's aggression moves the market price
 MIN_INTEREST_PER_WEEK = 0.5  # rival must gain ≥ this many lineup pts/week to care
 CLAIMS_PER_TWO_WEEKS = 1     # pacing: assume one meaningful add every two weeks
+# Season benchmark for a "typical good add": about 1 lineup point per remaining week. Without it a
+# thin waiver week makes ordinary adds look exceptional (e.g. +1 pt/wk rated worth 36% of a budget)
+# and spends money that better mid-season pickups will need.
+TYPICAL_ADD_PER_WEEK = 1.0
 CLAIMED_NOTE = "claimed by another owner"
 
 
@@ -94,9 +98,12 @@ def bid_profile(transactions: list, budget_total: float) -> dict:
 # ── Valuing a bid ────────────────────────────────────────────────────────────
 
 def typical_gain(gains: list, n_weeks: int) -> float:
-    """Rest-of-season gain of a 'typical good add': median of the 10 best positive gains."""
+    """
+    Rest-of-season gain of a 'typical good add': the median of this week's 10 best
+    positive gains, but never less than the season benchmark (TYPICAL_ADD_PER_WEEK).
+    """
     top = sorted((g for g in gains if g > 0), reverse=True)[:10]
-    floor = 0.5 * max(n_weeks, 1)
+    floor = TYPICAL_ADD_PER_WEEK * max(n_weeks, 1)
     return max(median(top), floor) if top else floor
 
 
@@ -137,8 +144,11 @@ def market_price_pct(profile: dict, ratio: float) -> float | None:
 
 
 def rival_interest(add: dict, rivals: list, ctx, players_db: dict, roster_positions: list,
-                   typical: float, profile: dict, trend_count: int = 0) -> list:
-    """Each rival's lineup gain from `add` and an estimated bid."""
+                   typical: float, profile: dict, trend_count: int = 0, rival_weights: dict | None = None) -> list:
+    """
+    Each rival's lineup gain from `add` and an estimated bid. `rival_weights`
+    ({roster_id: week weights}) values each rival's gain by its own playoff chances.
+    """
     weeks_left = len(ctx.weeks)
     trend_mult = 1 + min(0.5, (trend_count or 0) / 4000)  # league-wide add frenzy → bids run hotter
     out = []
@@ -150,7 +160,8 @@ def rival_interest(add: dict, rivals: list, ctx, players_db: dict, roster_positi
                       for pid in r.get("players") or []]
             r["_roster"] = roster
             r["_base"] = lineup_totals(roster, ctx, roster_positions)
-        ev = evaluate_add(add, roster, ctx, roster_positions, base_totals=r["_base"], max_drop_candidates=4)
+        ev = evaluate_add(add, roster, ctx, roster_positions, base_totals=r["_base"], max_drop_candidates=4,
+                          weights=(rival_weights or {}).get(r["roster_id"]))
         per_week = ev["gain_total"] / max(weeks_left, 1)
         aggression = profile["by_roster"].get(r["roster_id"], {}).get("aggression", 1.0)
         est = 0

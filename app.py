@@ -25,6 +25,10 @@ from src.players import RELEVANT_POSITIONS, build_sleeper_name_index, enrich_wit
 from src.schedule import (
     fetch_schedules, get_playoff_schedule_strength, get_weather_for_game, next_game_map, playoff_weeks_for,
 )
+from src.season import (
+    all_week_weights, combined_risk_prob, find_trades, league_dists, median_win_prob, simulate_season, team_week_dist,
+    week_weights, weeks_until_deadline,
+)
 from src.scoring import compute_fantasy_points, effective_scoring, scoring_key, scoring_label
 from src.simulator import (
     _summary, simulate_lineup_change, simulate_player, simulate_trade, win_shares,
@@ -33,7 +37,7 @@ from src.sleeper_integration import fetch_all_players, players_db_age_seconds, s
 from src.state_manager import list_leagues, load_league, save_league
 from src.storage import DATA_DIR
 from src.projections import Projections
-from src.valuation import ValuationContext, fantasy_weeks, lineup_suggestions, team_week_opponents
+from src.valuation import ValuationContext, fantasy_weeks, lineup_suggestions, lineup_totals, team_week_opponents
 from src.vegas import fetch_implied_totals
 from src.waiver_analysis import analyze_waiver_pool, build_claim_plan
 from src.wrangler import StatsIndex, current_nfl_season, fetch_weekly_stats
@@ -100,13 +104,29 @@ def load_context(key: tuple, _index, _matchups, _vegas, _players_db, _injury_map
     return ValuationContext(_index, proj, team_week_opponents(load_schedules()), _matchups, _injury_map, weeks,
                             _vegas, _players_db)
 
+@st.cache_resource(ttl=3 * 3600, max_entries=6, show_spinner="Simulating the rest of the season…")
+def load_season(key: tuple, _ctx, _league, _players_db):
+    """Every team's weekly lineup projection, and the playoff-odds simulation, for one league sync."""
+    positions = _league.get("roster_positions") or DEFAULT_ROSTER_POSITIONS
+    dists = league_dists(_league, _ctx, _players_db, positions)
+    return dists, simulate_season(_league, _ctx, _players_db, positions, dists=dists)
+
 @st.cache_resource(ttl=3 * 3600, max_entries=12, show_spinner="Pricing waiver claims against your league…")
-def load_waiver_engine(key: tuple, budget: int, _ctx, _roster, _waivers, _league, _players_db):
+def load_waiver_engine(key: tuple, budget: int, _ctx, _roster, _waivers, _league, _players_db, _weights,
+                       _rival_weights):
     """Waiver-pool analysis and this week's claim plan for one league sync and budget."""
     positions = _league.get("roster_positions") or DEFAULT_ROSTER_POSITIONS
-    analysis = analyze_waiver_pool(_roster, _waivers, _ctx, _league, _players_db, budget, positions)
-    analysis["plan"] = build_claim_plan(analysis, _roster, _ctx, budget, positions)
+    analysis = analyze_waiver_pool(_roster, _waivers, _ctx, _league, _players_db, budget, positions,
+                                   weights=_weights, rival_weights=_rival_weights)
+    analysis["plan"] = build_claim_plan(analysis, _roster, _ctx, budget, positions, weights=_weights)
     return analysis
+
+@st.cache_resource(ttl=3 * 3600, max_entries=6, show_spinner="Searching every rival roster for trades…")
+def load_trade_ideas(key: tuple, _roster, _league, _ctx, _players_db, _weights, _rival_weights):
+    """1-for-1 trades that help both teams, for one league sync."""
+    positions = _league.get("roster_positions") or DEFAULT_ROSTER_POSITIONS
+    rivals = [r for r in _league.get("league_rosters") or [] if r["roster_id"] != _league.get("roster_id")]
+    return find_trades(_roster, rivals, _ctx, _players_db, positions, _weights, _rival_weights)
 
 @st.cache_data(ttl=3 * 3600, show_spinner=False)
 def cached_weather(home_team: str, gameday: str):
@@ -373,12 +393,31 @@ if roster and current_data.get("week") and str(current_data.get("season", "")).i
     ctx = load_context(_engine_key, _index, _matchups, _vegas_totals, _players_db, _injury_map)
     if not ctx.weeks:
         ctx = None
-engine = load_waiver_engine(_engine_key, int(budget), ctx, roster, waivers, current_data, _players_db) \
-    if ctx and waivers else None
+# Playoff odds weight every rest-of-season value: a playoff week counts by the chance of being there
+team_dists, season_sim = load_season(_engine_key, ctx, current_data, _players_db) if ctx else ({}, None)
+my_p_playoffs = season_sim["p_playoffs"].get(current_data.get("roster_id")) if season_sim else None
+playoff_start = current_data.get("playoff_week_start")
+my_weights = week_weights(ctx.weeks, playoff_start, my_p_playoffs) if ctx else None
+rival_weights = all_week_weights(season_sim, ctx.weeks, playoff_start) if ctx else {}
+engine = load_waiver_engine(_engine_key, int(budget), ctx, roster, waivers, current_data, _players_db,
+                            my_weights, rival_weights) if ctx and waivers else None
 candidate_by_id = {c.get("player_id") or c["name"]: c for c in (engine or {}).get("candidates", [])}
 week_now = ctx.current_week if ctx else None
 if ctx and not (ctx.projections and ctx.projections.available):
     st.warning("Sleeper projections are unavailable right now — values use past production only.")
+
+
+# This week's outlook, shared by the Roster and Who to Start tabs: the head-to-head game and,
+# in leagues that use one, the league-median game (a win for finishing in the top half)
+mu = current_data.get("matchup") or {}
+mu_proj = matchup_projection(mu.get("starters") or [], mu.get("opponent_starters") or [], ctx, _players_db) \
+    if ctx and mu.get("opponent") else None
+p_median = None
+if ctx and current_data.get("median_game") and mu.get("starters"):
+    p_median = median_win_prob(team_week_dist(mu["starters"], ctx, _players_db, week_now),
+                               [d[week_now] for rid, d in team_dists.items() if rid != current_data.get("roster_id")],
+                               seed=f"{selected_league}|{week_now}")
+risk_p = combined_risk_prob(mu_proj["p_win"] if mu_proj else None, p_median)
 
 
 def proj_now(p) -> float | None:
@@ -479,15 +518,13 @@ with tab_roster:
     if not roster:
         st.info("Sync a league from the sidebar.")
     else:
-        mu = current_data.get("matchup")
         lineup = lineup_suggestions(roster, ctx, roster_positions) if ctx else None
         if mu and mu.get("bye"):
             st.caption(f"Week {mu['week']}: bye")
         elif mu and mu.get("opponent"):
             opp_rec = mu.get("opponent_record") or {}
             opp_rec_str = f" ({opp_rec.get('wins', 0)}-{opp_rec.get('losses', 0)})" if opp_rec else ""
-            proj_mu = matchup_projection(mu.get("starters") or [], mu.get("opponent_starters") or [], ctx, _players_db) \
-                if ctx else None
+            proj_mu = mu_proj
             live = (mu.get("points") or 0) + (mu.get("opponent_points") or 0) > 0
             mc1, mc2, mc3, mc4 = st.columns(4)
             if proj_mu:
@@ -503,9 +540,15 @@ with tab_roster:
                     fixed = matchup_projection(fixed_ids, mu.get("opponent_starters") or [], ctx, _players_db)
                     mc4.metric("Win chance with fixes below", f"{fixed['p_win']:.0%}",
                                f"{fixed['p_win'] - proj_mu['p_win']:+.0%}")
+                if p_median is not None:
+                    md1, md2, _, _ = st.columns(4)
+                    md1.metric("Median game: top-half finish", f"{p_median:.0%}",
+                               help="This league also scores every team against the league median each week.")
+                    md2.metric("Expected wins this week", f"{proj_mu['p_win'] + p_median:.1f} of 2")
                 st.caption(f"Projections for both starting lineups as set in Sleeper at the last sync. "
-                           f"Suggested start/sit style this week: **{risk_mode(proj_mu['p_win'])}** "
-                           "(favorites should cut variance, underdogs should chase upside).")
+                           f"Suggested start/sit style this week: **{risk_mode(risk_p)}** "
+                           + ("based on both games, head-to-head and the median " if p_median is not None else "")
+                           + "(favorites should cut variance, underdogs should chase upside).")
             else:
                 mc1.metric(f"Week {mu['week']} — You", f"{mu['points']:g}")
                 mc2.metric(f"{mu['opponent']}{opp_rec_str}", f"{mu['opponent_points']:g}")
@@ -564,15 +607,26 @@ with tab_roster:
                 gap = (f", {abs(margin):g} game(s) {'ahead of' if margin >= 0 else 'behind'} the cutoff"
                        if margin is not None else "")
                 title += f" — you're #{pp['rank']} of {pp['teams']}, {where}{gap}"
+            if my_p_playoffs is not None:
+                title += f" · {my_p_playoffs:.0%} playoff chances"
             with st.expander(title):
                 st.dataframe(pd.DataFrame([{
                     "#": r["rank"], "Team": r["team_name"] + (" (you)" if r["roster_id"] == current_data.get("roster_id") else ""),
                     "W-L": f"{r['record']['wins']}-{r['record']['losses']}" + (f"-{r['record']['ties']}" if r['record'].get('ties') else ""),
                     "PF": r["record"]["points_for"], "FAAB left": r["faab_remaining"],
                     "Waiver #": r["record"].get("waiver_position"),
-                } for r in standings(league_rosters)]), hide_index=True, width="stretch")
+                    **({"Playoff chances": season_sim["p_playoffs"].get(r["roster_id"]),
+                        "Projected wins": season_sim["exp_wins"].get(r["roster_id"])} if season_sim else {}),
+                } for r in standings(league_rosters)]), hide_index=True, width="stretch",
+                    column_config={"Playoff chances": st.column_config.ProgressColumn(
+                        format="percent", min_value=0, max_value=1)})
                 if pp:
                     st.caption(f"Top {pp['playoff_teams']} make the playoffs. Ranked by wins, then points for.")
+                if season_sim:
+                    st.caption(f"Playoff chances simulate the {len(season_sim['weeks'])} remaining regular-season "
+                               "weeks of Sleeper's schedule from every team's projected best lineup"
+                               + (", including the weekly median game" if current_data.get("median_game") else "")
+                               + ". Waiver and trade values count each playoff week by your chance of being there.")
 
         missing = df_roster[df_roster["Stats"] == "⚠️ not found"]["Player"].tolist()
         if missing:
@@ -599,7 +653,10 @@ with tab_waivers:
             st.caption("Ranked by how much each player improves **your best starting lineup** from now through the "
                        "fantasy playoffs, after dropping your least valuable player. Bids are priced from this "
                        "league's past winning bids and which rivals would also want the player. "
-                       "The **🧾 FAAB Planner** tab turns this into a set of claims that fit your budget.")
+                       "The **🧾 FAAB Planner** tab turns this into a set of claims that fit your budget."
+                       + (f" Playoff weeks count by your {my_p_playoffs:.0%} playoff chances (halved for each later "
+                          "round), so points sooner are worth more when the playoffs are uncertain."
+                          if my_p_playoffs is not None else ""))
             if worth:
                 st.dataframe(pd.DataFrame([{
                     "Player": c["name"], "Pos": c.get("position"), "Team": c.get("team"),
@@ -947,10 +1004,7 @@ with tab_start_sit:
     if not roster:
         st.info("Sync a league to compare roster players.")
     else:
-        mu = current_data.get("matchup") or {}
-        mu_proj = matchup_projection(mu.get("starters") or [], mu.get("opponent_starters") or [], ctx, _players_db) \
-            if ctx and mu.get("opponent") else None
-        default_style = risk_mode(mu_proj["p_win"] if mu_proj else None)
+        default_style = risk_mode(risk_p)
         sc1, sc2 = st.columns([3, 2])
         selected_players = sc1.multiselect("Select 2–4 players to compare", list(roster_by_name), max_selections=4)
         style = sc2.radio("Start/sit style", ["Safe", "Balanced", "Upside"], horizontal=True,
@@ -958,8 +1012,10 @@ with tab_start_sit:
                           key=f"ss_style_{selected_league}",
                           help="Safe ranks by floor (10th percentile), Balanced by projection, Upside by ceiling "
                                "(90th percentile)." + (f" Defaulted to {default_style}: you have a "
-                                                       f"{mu_proj['p_win']:.0%} chance to win this week."
-                                                       if mu_proj else ""))
+                                                       f"{risk_p:.0%} chance to win this week"
+                                                       + (" (average of the head-to-head and median games)."
+                                                          if p_median is not None else ".")
+                                                       if risk_p is not None else ""))
         if st.button("⚖️ Compare"):
             st.session_state.ss_request = tuple(selected_players)
 
@@ -1085,6 +1141,34 @@ with tab_start_sit:
 with tab_trade:
     st.subheader("Trade Analyzer")
 
+    deadline = current_data.get("trade_deadline")
+    to_deadline = weeks_until_deadline(deadline, week_now)
+    if to_deadline is not None and to_deadline < 0:
+        st.warning(f"The trade deadline (week {deadline}) has passed — trades are closed for this season.")
+    elif to_deadline == 0:
+        st.warning(f"This is the trade deadline week (week {deadline}).")
+    elif to_deadline is not None:
+        st.info(f"Trade deadline: week {deadline}, {to_deadline} week(s) away.")
+
+    rival_rosters = [r for r in current_data.get("league_rosters") or [] if r["roster_id"] != current_data.get("roster_id")]
+    if ctx and rival_rosters and (to_deadline is None or to_deadline >= 0):
+        with st.expander("🔎 Trade finder: 1-for-1 trades that help both teams"):
+            st.caption("Tries swapping each of your top 12 players for each rival's top 12, and keeps trades that "
+                       "raise both teams' best starting lineups for the rest of the season (each team's playoff "
+                       "weeks weighted by its own playoff chances). Trades that help both sides get accepted; "
+                       "the list is sorted by the smaller of the two gains.")
+            if st.button("Find trades"):
+                st.session_state.trade_finder = _engine_key
+            if st.session_state.get("trade_finder") == _engine_key:
+                ideas = load_trade_ideas(_engine_key, roster, current_data, ctx, _players_db, my_weights, rival_weights)
+                if ideas:
+                    st.dataframe(pd.DataFrame([{
+                        "Trade with": t["team"], "You give": f"{t['give']} ({t['give_pos']})",
+                        "You get": f"{t['get']} ({t['get_pos']})", "Your gain (ROS pts)": t["gain_me"],
+                        "Their gain (ROS pts)": t["gain_them"]} for t in ideas]), hide_index=True, width="stretch")
+                else:
+                    st.info("No 1-for-1 trade improves both lineups right now.")
+
     roster_ids = {p.get("player_id") for p in roster if p.get("player_id")}
     trade_pool = {p["player_id"]: p for p in _trade_pool if p["player_id"] not in roster_ids}
 
@@ -1126,6 +1210,15 @@ with tab_trade:
 
         verdict = trade["verdict"]
         st.markdown(f"## :{verdict_color(verdict)}[{verdict}]  — {headline}")
+        if ctx:
+            # Same weekly projections as the waiver engine: who'd actually start, week by week, through the playoffs
+            before = lineup_totals(roster, ctx, roster_positions)
+            after = lineup_totals([p for p in roster if p["name"] not in giving]
+                                  + [{**p, "slot": "BN"} for p in receiving_players], ctx, roster_positions)
+            ros_delta = sum((after[w] - before[w]) * my_weights.get(w, 1.0) for w in ctx.weeks)
+            st.metric("Rest of season, from weekly projections", f"{ros_delta:+.1f} lineup pts",
+                      help=f"Your best lineup's projected points over weeks {ctx.weeks[0]}–{ctx.weeks[-1]}, "
+                           "after vs. before, with playoff weeks counted by your playoff chances.")
         st.caption("Verdict is based on your best possible starting lineup before vs. after the trade, so "
                    "bench depth only counts if it would start. Value over replacement (VORP) is shown per player.")
 

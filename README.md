@@ -33,11 +33,11 @@ season, so update the IDs when a new season starts.
 
 | Tab | What you get |
 |---|---|
-| 📋 Roster | Projected score for both lineups this week and your win chance, **lineup fixes** that name who to start in place of an Out, bye-week or weaker starter (and the win chance after), every player with this week's and rest-of-season projections, and league standings with your playoff position. |
+| 📋 Roster | Projected score for both lineups this week and your win chance (plus your chance of beating the league median, in leagues with a median game), **lineup fixes** that name who to start in place of an Out, bye-week or weaker starter (and the win chance after), every player with this week's and rest-of-season projections, and league standings with every team's **playoff chances**. |
 | 🔄 Waivers | **Bid recommendations**: every add that would improve your best starting lineup, with its gain, the player to drop, what he's worth to you, the suggested bid and its chance to win. Below that, the browsable pool and a deep dive with the lineup gain by week, the win-probability curve by bid, which rivals also want him, plus matchup/weather/usage/Vegas context. |
 | 🧾 FAAB Planner | This week's claims in priority order, each with its own drop and bid, within your budget; the waiver deadline; what this league pays for adds; every team's remaining FAAB and bidding style; and your FAAB log (cost vs. points scored since). |
 | ⚖️ Who to Start | Compare 2–4 roster players on this week's projection. Choose **Safe** (rank by floor), **Balanced** (projection) or **Upside** (ceiling); it defaults from your matchup win chance — favorites play it safe, underdogs chase upside. |
-| 🤝 Trade | Pick players to give from your roster and players to receive from any NFL team. The verdict comes from your **best starting lineup before vs. after**, so a 2-for-1 is judged by who would actually start. Per-player value over replacement and playoff-week schedule strength are also shown. |
+| 🤝 Trade | The trade deadline, a **trade finder** (1-for-1 swaps with any rival that raise both teams' rest-of-season lineups), and an analyzer: pick players to give and receive. The verdict comes from your **best starting lineup before vs. after**, so a 2-for-1 is judged by who would actually start, plus the rest-of-season change from weekly projections. Per-player value over replacement and playoff-week schedule strength are also shown. |
 | 🏗️ Roster Construction | Grades for the positions your league's lineup actually uses, measured against league-specific replacement levels, plus waiver targets boosted where you're weak. |
 
 The sidebar shows your team, record and a **📜 League Settings** summary (teams, lineup, scoring, waivers, playoff
@@ -57,12 +57,22 @@ weeks). **🔄 Refresh data** re-downloads the NFL stats, schedule, Sleeper play
 - **History value**: expected points = 35% recent + 65% season. Backtested on 2025 (`python -m src.backtest`), this
   predicted the next 4 weeks better than heavier recent weighting.
 - **Weekly projection**: 80% Sleeper's weekly projection (scored with your league's settings) + 20% history value
-  × opponent-defense multiplier — the most accurate blend in the backtest. It is 0 on bye weeks and while injured,
-  using estimated absences (Out 1 week, suspension 2, IR/PUP 4; Sleeper gives no return dates). Rookies with no
-  history use the projection alone. Defense multipliers are pulled toward average early in the season.
+  × opponent-defense multiplier — the most accurate blend in the backtest. It is 0 on bye weeks and while injured.
+  For every week Sleeper has published projections, a player it leaves out counts as **0**: in 2025 those players
+  (backups, injured players) played 7% of the time and averaged 0.09 points, while their history predicted 4.3.
+  This also means injury return timing comes from Sleeper; the fixed estimates (Out 1 week, suspension 2,
+  IR/PUP 4) apply only to weeks Sleeper hasn't projected yet. Rookies with no history use the projection alone.
+  Defense multipliers are pulled toward average early in the season.
   The projections endpoint is unofficial; if it stops working the app says so and uses history only.
 - **Replacement level**: the PPG of the first player past the league's rostered depth at each position. Depth is
   derived from team count and lineup slots (FLEX and SUPER_FLEX included).
+- **Playoff odds**: the remaining regular-season schedule (synced from Sleeper) is simulated 4,000 times from
+  every team's projected best lineup, with the weekly median game when the league has one, ranking by wins then
+  points for. Rest-of-season values (waiver gains, bids, trades) count regular-season weeks fully and each playoff
+  week by the chance of still being alive: playoff odds, halved for every earlier round. A bubble team therefore
+  values points now over points in week 17.
+- **Median game**: your chance of finishing in the top half this week. Start/sit style then uses the average of
+  the head-to-head and median win chances.
 - **Monte Carlo**: a zero-inflated Gamma fitted to each player's weekly scores (10,000 draws). Samples are seeded
   per player, so every chart and probability for that player uses the same draws. Start/sit centers each
   player's distribution on this week's projection.
@@ -74,8 +84,10 @@ weeks). **🔄 Refresh data** re-downloads the NFL stats, schedule, Sleeper play
    championship. DEF and K count only the next 2 weeks, since they can be streamed for $0. Backup RBs get a small
    insurance bonus when you roster their starter, and a "promoted" note when a player ahead of them on the depth
    chart is out.
-2. **Worth to you**: that gain compared with a typical good add this week, times your budget spread over the
-   claims you can still make (about one every two weeks). Late in the season each claim is worth more.
+2. **Worth to you**: that gain compared with a typical good add, times your budget spread over the claims you can
+   still make (about one every two weeks). A typical add is the median of this week's 10 best gains but never less
+   than about 1 lineup point per remaining week, so a thin waiver week doesn't make ordinary adds look exceptional.
+   Late in the season each claim is worth more.
 3. **Competition**: the same lineup-gain math runs on every rival roster. A rival "wants" a player who adds ≥0.5
    pts/week to their lineup. The competing bid is priced from this league's own winning bids for an add of that
    size, adjusted for the most aggressive interested manager and capped by their FAAB.
@@ -132,12 +144,13 @@ src/
   players.py               Name/team normalization, Sleeper ↔ nflverse ID linking
   config.py                config.toml + .env settings
   league_sync.py           Auto-sync of the configured leagues
-  sleeper_integration.py   League sync (lineup slots, record, matchup, FAAB, waiver pool), shared player DB
+  sleeper_integration.py   League sync (lineup slots, record, matchup, schedule, FAAB, waiver pool), shared player DB
   evaluator.py             History value model, generic waiver score, lineup optimizer, trades, roster grades
   projections.py           Sleeper weekly projections, scored with league settings
   valuation.py             Week-by-week player values, lineup gains, lineup fixes
   market.py                League bid history, rival interest, win curves, bids, claim planner, standings
   waiver_analysis.py       Runs the above over the waiver pool and builds the claim plan
+  season.py                Playoff-odds simulation, median game, week weights, trade finder
   backtest.py              2025 backtest of the projection/history blend (python -m src.backtest 2025)
   simulator.py             Monte Carlo simulations
   defense.py               Points allowed by defense × position

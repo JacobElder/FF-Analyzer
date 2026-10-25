@@ -77,6 +77,10 @@ class Projections:
     def available(self) -> bool:
         return any(self.points.values())
 
+    def covers(self, week: int) -> bool:
+        """True when Sleeper published projections for `week`, so a missing player means 'not expected to play'."""
+        return bool(self.points.get(week))
+
     def get(self, player_id: str | None, week: int) -> float | None:
         if not player_id:
             return None

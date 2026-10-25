@@ -177,6 +177,28 @@ def _current_matchup(league_id: str, week, my_roster: dict, rosters: list, team_
     }
 
 
+def _schedule(league_id: str, week, playoff_week_start) -> dict:
+    """
+    {week: [[roster_id, roster_id], ...]} for the rest of the regular season.
+    Sleeper publishes every week's pairings in advance; weeks it can't return are left out.
+    """
+    if not week:
+        return {}
+    weeks = list(range(int(week), int(playoff_week_start or 15)))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(lambda wk: _get(f"/league/{league_id}/matchups/{wk}"), weeks))
+    out = {}
+    for wk, (rows, _err) in zip(weeks, responses):
+        pairs: dict = {}
+        for m in rows or []:
+            if m.get("matchup_id") is not None:
+                pairs.setdefault(m["matchup_id"], []).append(m.get("roster_id"))
+        games = [ids for ids in pairs.values() if len(ids) == 2]
+        if games:
+            out[str(wk)] = games
+    return out
+
+
 def _league_rosters(rosters: list, league: dict, team_names: dict) -> list:
     """Compact view of every team: players, FAAB left, waiver order, record."""
     out = []
@@ -315,6 +337,9 @@ def sync_sleeper_league(username: str, league_id_or_name: str):
         "waiver_settings": {k: settings.get(k) for k in
                             ("waiver_type", "waiver_day_of_week", "waiver_clear_days", "waiver_bid_min", "daily_waivers")},
         "playoff_teams": settings.get("playoff_teams"),
+        "median_game": bool(settings.get("league_average_match")),  # each week also scored vs the league median
+        "trade_deadline": settings.get("trade_deadline"),
+        "schedule": _schedule(league_id, week, settings.get("playoff_week_start")),
         "roster": roster,
         "waivers": build_waiver_pool(rosters, players_db, trend_map),
         "scoring_settings": league.get("scoring_settings", {}),

@@ -546,3 +546,54 @@ def test_refresh_clears_cached_projections(leagues_dir):
     _widget(at.sidebar.button, "🔄 Refresh data").click()
     _run(at)
     assert not stale.exists()
+
+
+_SCHEDULE = {str(w): [[1, 2]] for w in range(WEEK, 15)}
+
+
+def test_playoff_odds_median_game_and_trade_finder(monkeypatch, leagues_dir):
+    import src.season
+    sm.save_league(_league(schedule=_SCHEDULE, median_game=True, trade_deadline=11))
+    monkeypatch.setattr(src.season, "find_trades", lambda *a, **k: [
+        {"team": "Rival", "roster_id": 2, "give": "Bench Guy", "give_pos": "WR", "get": "Rival Receiver",
+         "get_pos": "WR", "gain_me": 4.2, "gain_them": 1.1}])
+    at = _run()
+    assert "Median game: top-half finish" in [m.label for m in at.metric]
+    assert any("playoff chances" in e.label for e in at.expander)
+    standings_df = next(d.value for d in at.dataframe if "Playoff chances" in d.value.columns)
+    assert standings_df["Playoff chances"].between(0, 1).all()
+    text = _text(at)
+    assert "Playoff chances simulate" in text and "Trade deadline: week 11, 8 week(s) away." in text
+    assert "Playoff weeks count by your" in text
+    _widget(at.button, "Find trades").click()
+    _run(at)
+    ideas = next(d.value for d in at.dataframe if "Trade with" in d.value.columns)
+    assert ideas.iloc[0]["You get"] == "Rival Receiver (WR)"
+
+
+def test_trade_finder_with_no_ideas(monkeypatch, leagues_dir):
+    import src.season
+    sm.save_league(_league(schedule=_SCHEDULE, trade_deadline=WEEK))
+    monkeypatch.setattr(src.season, "find_trades", lambda *a, **k: [])
+    at = _run()
+    assert f"This is the trade deadline week (week {WEEK})." in _text(at)
+    _widget(at.button, "Find trades").click()
+    _run(at)
+    assert "No 1-for-1 trade improves both lineups right now." in _text(at)
+
+
+def test_trades_closed_after_the_deadline(leagues_dir):
+    sm.save_league(_league(trade_deadline=WEEK - 1))
+    at = _run()
+    assert "has passed" in _text(at)
+    assert not [b for b in at.button if b.label == "Find trades"]
+
+
+def test_trade_analysis_shows_rest_of_season_projection(leagues_dir):
+    sm.save_league(_league())
+    at = _run()
+    _widget(at.multiselect, "You Give (from your roster)").select("Bench Guy")
+    _run(at)
+    _widget(at.button, "🤝 Analyze Trade").click()
+    _run(at)
+    assert "Rest of season, from weekly projections" in [m.label for m in at.metric]

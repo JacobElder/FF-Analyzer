@@ -4,9 +4,14 @@ Week-by-week player values and lineup-based roster math.
 A player's value in week W is, in order of preference:
   1. PROJECTION_WEIGHT × Sleeper projection + (1 − PROJECTION_WEIGHT) × history value
   2. the Sleeper projection alone (no usable history, e.g. rookies)
-  3. the history value: expected points × that week's opponent-defense multiplier
-  4. DEF/K only: a rough Vegas-based estimate for the current week
-and is 0 on bye weeks and while injured (see INJURY_WEEKS_OUT).
+  3. 0 when Sleeper published projections for W but not for him: backups and injured
+     players it leaves out played 7% of the time and averaged 0.09 pts in 2025
+     (their history predicted 4.3)
+  4. the history value: expected points × that week's opponent-defense multiplier
+  5. DEF/K only: a rough Vegas-based estimate for the current week
+and is 0 on bye weeks and while injured. Injury timing comes from Sleeper's
+projections for the weeks they cover (they stop projecting a player until he's
+expected back); INJURY_WEEKS_OUT estimates are used only for weeks they don't.
 
 An add is worth what it does to your *best starting lineup* in each remaining
 week through the end of the fantasy playoffs, net of the player you drop.
@@ -99,9 +104,27 @@ class ValuationContext:
     def weeks_out(self, p: dict) -> int:
         return INJURY_WEEKS_OUT.get(self.injury(p), 0)
 
+    def covers(self, week: int) -> bool:
+        """Sleeper projections exist for `week` (stand-ins without `covers` never do)."""
+        return bool(self.projections is not None and hasattr(self.projections, "covers")
+                    and self.projections.covers(week))
+
     def return_week(self, p: dict) -> int | None:
+        """Estimated first week back for an injured player, or None."""
         out = self.weeks_out(p)
-        return self.current_week + out if out and self.current_week else None
+        if not out or not self.current_week:
+            return None
+        pid = p.get("player_id")
+        if pid:
+            for w in self.weeks[1:]:
+                if not self.covers(w):
+                    break  # past Sleeper's projections: fall back to the estimate
+                if self.projections.get(pid, w) is not None:
+                    return w
+            else:
+                if any(self.covers(w) for w in self.weeks[1:]):
+                    return None  # Sleeper doesn't project him back this season
+        return self.current_week + out
 
     def _history_value(self, p: dict, stats: dict, week: int) -> float | None:
         if not stats.get("found") or stats["season"]["games"] < 2:
@@ -140,10 +163,15 @@ class ValuationContext:
             if not p.get("team") or (team_sched and w not in team_sched):
                 values[w] = 0.0  # bye week or no NFL team
                 continue
-            if self.current_week is not None and w < self.current_week + out_weeks:
-                values[w] = 0.0  # still injured (estimate)
+            covered = self.covers(w)
+            # Out this week by designation; later weeks: Sleeper's projections decide, else the estimate
+            if out_weeks and (w == self.current_week or (not covered and w < self.current_week + out_weeks)):
+                values[w] = 0.0
                 continue
             proj = _finite(self.projections.get(p.get("player_id"), w) if self.projections else None)
+            if covered and proj is None and p.get("player_id"):
+                values[w] = 0.0  # Sleeper projected this week but left him out: not expected to play
+                continue
             hist = _finite(self._history_value(p, stats, w))
             if proj is not None and hist is not None:
                 v = PROJECTION_WEIGHT * proj + (1 - PROJECTION_WEIGHT) * hist
@@ -231,10 +259,13 @@ def handcuff_bonus(add: dict, roster: list, ctx: ValuationContext) -> tuple[floa
 
 
 def evaluate_add(add: dict, roster: list, ctx: ValuationContext, roster_positions: list | None = None,
-                 base_totals: dict | None = None, max_drop_candidates: int = 6) -> dict:
+                 base_totals: dict | None = None, max_drop_candidates: int = 6, weights: dict | None = None) -> dict:
     """
     Rest-of-season lineup gain from adding `add`, dropping whichever player
     costs the least (no drop if there's an open roster spot).
+
+    `weights` ({week: multiplier}, default 1) scales each week's gain in the total,
+    e.g. playoff weeks by the chance of being there; `weekly_gain` stays unweighted.
 
     Returns {"gain_total", "gain_per_week", "weekly_gain", "drop", "handcuff_for", "handcuff_bonus"}
     """
@@ -255,7 +286,8 @@ def evaluate_add(add: dict, roster: list, ctx: ValuationContext, roster_position
         new_roster = [p for p in roster if p is not drop] + [{**add, "slot": "BN"}]
         totals = lineup_totals(new_roster, ctx, positions)
         weekly = {w: round(totals[w] - base[w], 2) if w in horizon else 0.0 for w in ctx.weeks}
-        options.append({"drop": drop, "gain_total": round(sum(weekly.values()) + bonus, 2), "weekly_gain": weekly})
+        total = sum(g * (weights or {}).get(w, 1.0) for w, g in weekly.items())
+        options.append({"drop": drop, "gain_total": round(total + bonus, 2), "weekly_gain": weekly})
     options.sort(key=lambda o: -o["gain_total"])
 
     best = dict(options[0])

@@ -14,7 +14,12 @@ RIVAL_CANDIDATES = 35    # candidates that get the (slower) rival / win-curve an
 
 
 def analyze_waiver_pool(roster: list, waivers: list, ctx, league: dict, players_db: dict,
-                        budget: int, roster_positions: list | None = None) -> dict:
+                        budget: int, roster_positions: list | None = None, weights: dict | None = None,
+                        rival_weights: dict | None = None) -> dict:
+    """
+    `weights` ({week: multiplier}) values your gains by how much each week matters to you
+    (see season.week_weights); `rival_weights` does the same per rival roster_id.
+    """
     positions = roster_positions or DEFAULT_ROSTER_POSITIONS
     weeks_left = len(ctx.weeks)
     profile = bid_profile(league.get("transactions") or [], league.get("waiver_budget_total") or 100)
@@ -24,7 +29,7 @@ def analyze_waiver_pool(roster: list, waivers: list, ctx, league: dict, players_
 
     base = lineup_totals(roster, ctx, positions)
     pool = sorted(waivers, key=ctx.ros_total, reverse=True)[:TOP_CANDIDATES]
-    evals = sorted(((w, evaluate_add(w, roster, ctx, positions, base)) for w in pool),
+    evals = sorted(((w, evaluate_add(w, roster, ctx, positions, base, weights=weights)) for w in pool),
                    key=lambda we: -we[1]["gain_total"])
     typical = typical_gain([e["gain_total"] for _, e in evals], weeks_left)
 
@@ -34,7 +39,7 @@ def analyze_waiver_pool(roster: list, waivers: list, ctx, league: dict, players_
         rivals_view, curve = [], []
         if i < RIVAL_CANDIDATES and e["gain_total"] > 0 and rivals:
             rivals_view = rival_interest(w, rivals, ctx, players_db, positions, typical, profile,
-                                         w.get("trend_count", 0))
+                                         w.get("trend_count", 0), rival_weights=rival_weights)
             top_rival = max((r["est_bid"] for r in rivals_view), default=0)
             ceiling = min(budget, max(3 * max_pay, 3 * top_rival, 10))
             market_pct = market_price_pct(profile, e["gain_total"] / typical if typical > 0 else 1.0)
@@ -95,7 +100,7 @@ def analyze_waiver_pool(roster: list, waivers: list, ctx, league: dict, players_
 
 
 def build_claim_plan(analysis: dict, roster: list, ctx, budget: int, roster_positions: list | None = None,
-                     max_claims: int = 5) -> list:
+                     max_claims: int = 5, weights: dict | None = None) -> list:
     """
     This week's claims in priority order. Each later claim is re-valued against
     the roster as it would be if the earlier claims (and their drops) went through.
@@ -106,6 +111,6 @@ def build_claim_plan(analysis: dict, roster: list, ctx, budget: int, roster_posi
         dropped = {p["drop_name"] for p in plan_so_far if p["drop_name"]}
         added = [{**p, "slot": "BN"} for p in plan_so_far]
         new_roster = [p for p in roster if p["name"] not in dropped] + added
-        return evaluate_add(c, new_roster, ctx, positions)["drop_options"]
+        return evaluate_add(c, new_roster, ctx, positions, weights=weights)["drop_options"]
 
     return plan_claims(analysis["candidates"], budget, analysis["open_spots"], max_claims, reevaluate=reevaluate)

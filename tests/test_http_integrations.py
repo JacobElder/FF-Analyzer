@@ -260,3 +260,18 @@ def test_weather_flags_at_thresholds(monkeypatch, daily, flags):
 def test_weather_http_error_is_none(monkeypatch):
     monkeypatch.setattr(schedule.requests, "get", lambda *a, **k: FakeResponse(503))
     assert schedule.get_weather_for_game("BUF", _future()) is None
+
+
+def test_sync_stores_schedule_median_game_and_trade_deadline(monkeypatch):
+    routes = _sleeper_routes(**{
+        f"/league/{LID}/matchups/4": [{"roster_id": 1, "matchup_id": 2}, {"roster_id": 2, "matchup_id": 2},
+                                      {"roster_id": 3, "matchup_id": None}],  # no game: left out
+        f"/league/{LID}/matchups/5": [{"roster_id": 1, "matchup_id": 1}],      # opponent missing: left out
+    })
+    routes[f"/league/{LID}"]["settings"].update({"league_average_match": 1, "trade_deadline": 11})
+    _route(monkeypatch, si, si.BASE_URL, routes)
+    data, err = si.sync_sleeper_league("me", LID)
+    assert err is None
+    assert data["schedule"] == {"3": [[1, 2]], "4": [[1, 2]]}  # weeks 6–14 unavailable: skipped
+    assert data["median_game"] is True and data["trade_deadline"] == 11
+    assert si._schedule(LID, None, 15) == {}
