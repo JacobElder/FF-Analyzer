@@ -95,6 +95,32 @@ tuned against league history, not backtested. Treat bids as a well-informed star
 | `CLAUDE_MODEL` / `GEMINI_MODEL` | Override model IDs (defaults: `claude-sonnet-5-5`, `gemini-2.5-flash`). |
 | `ODDS_API_KEY` | Vegas implied team totals ([the-odds-api.com](https://the-odds-api.com), free tier). |
 | `SLEEPER_USERNAME` / `SLEEPER_LEAGUE_IDS` / `SLEEPER_AUTO_SYNC_MINUTES` | Override `config.toml` (IDs comma-separated). |
+| `AI_PASSWORD` | Optional. Locks the AI buttons until this password is entered in the sidebar. Unset = AI open. |
+
+## Deployment
+
+Live at **https://jelderffanalyzer.streamlit.app** (Streamlit Community Cloud, public repo, Python 3.12).
+Every push to `main` redeploys it. Secrets are set in the app's **⋮ → Settings → Secrets** (TOML format,
+values in quotes); root-level secrets reach the app as environment variables.
+
+The cloud copy's saved files reset on every restart, so only leagues listed in `config.toml` persist there.
+
+### To do
+
+- [ ] **Turn on AI in the live app.** Go to share.streamlit.io → **My apps** → **⋮** next to FF-Analyzer →
+  **Settings** → **Secrets**, and make the box look like this:
+
+  ```toml
+  ODDS_API_KEY = "your-odds-key"
+  GOOGLE_API_KEY = "your-google-key"
+  AI_PASSWORD = "pick-a-password"
+  ```
+
+  - Copy both keys from your local `.env` file.
+  - Add `AI_PASSWORD` in the same save as `GOOGLE_API_KEY`. Without it, the AI buttons are open to anyone
+    with the link, who could spend your Google key.
+  - Then open the app, enter the password in **🔒 AI password** in the sidebar, and pick **Gemini (Google)**.
+    The password is asked again each time the app is opened fresh.
 
 ## Project layout
 
