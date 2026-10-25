@@ -9,6 +9,7 @@ callers fall back to history-based values.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -64,10 +65,13 @@ class Projections:
 
     def __init__(self, season: int, weeks: list, scoring: dict, completed_through: int = 0, force: bool = False):
         self.weeks = list(weeks)
-        self.points: dict[int, dict[str, float]] = {}
-        for w in self.weeks:
-            raw = fetch_week_projections(season, w, completed=w <= completed_through, force=force)
-            self.points[w] = {pid: score_projection(st, scoring) for pid, st in raw.items()}
+        # Download the weeks in parallel: on a cold start that is ~11 requests
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            raws = list(pool.map(
+                lambda w: fetch_week_projections(season, w, completed=w <= completed_through, force=force),
+                self.weeks))
+        self.points: dict[int, dict[str, float]] = {
+            w: {pid: score_projection(st, scoring) for pid, st in raw.items()} for w, raw in zip(self.weeks, raws)}
 
     @property
     def available(self) -> bool:

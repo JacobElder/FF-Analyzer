@@ -151,6 +151,7 @@ def offline_app(monkeypatch):
     st.cache_data.clear()
     st.cache_resource.clear()
     monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+    monkeypatch.delenv("AI_PASSWORD", raising=False)
     monkeypatch.setattr(src.config, "load_config",
                         lambda *a, **k: {"username": "", "league_ids": [], "auto_sync_minutes": 30.0})
     monkeypatch.setattr(src.wrangler, "fetch_weekly_stats", lambda *a, **k: _weekly_stats())
@@ -271,6 +272,33 @@ def test_ai_buttons_without_keys_show_setup_warning(leagues_dir):
         _run(at)
     assert "API key not configured" in _text(at)
 
+
+
+def test_ai_password_locks_ai_buttons_until_entered(monkeypatch, leagues_dir):
+    monkeypatch.setenv("AI_PASSWORD", "letmein")
+    sm.save_league(_league())
+    at = _run()
+    _widget(at.multiselect, "Select 2–4 players to compare").select("Ja'Marr Chase").select("Bench Guy")
+    _run(at)
+    _widget(at.button, "⚖️ Compare").click()
+    _run(at)
+    assert not [b for b in at.button if "AI" in b.label]
+    assert "Enter the AI password" in _text(at)
+
+    _widget(at.sidebar.text_input, "🔒 AI password").input("wrong")
+    _run(at)
+    assert "Wrong password." in [e.value for e in at.sidebar.error]
+
+    _widget(at.sidebar.text_input, "🔒 AI password").input("letmein")
+    _run(at)
+    assert not [w for w in at.sidebar.text_input if w.label == "🔒 AI password"]
+    _widget(at.button, "⚖️ Compare").click()
+    _run(at)
+    ai_buttons = [b for b in at.button if "AI" in b.label]
+    assert ai_buttons
+    _widget(at.button, ai_buttons[0].label).click()
+    _run(at)
+    assert "API key not configured" in _text(at)
 
 def test_budget_change_and_zero_budget(leagues_dir):
     sm.save_league(_league())

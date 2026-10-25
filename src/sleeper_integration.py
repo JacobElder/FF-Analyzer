@@ -7,6 +7,7 @@ no more than about once a day.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import requests
@@ -196,8 +197,10 @@ def _league_rosters(rosters: list, league: dict, team_names: dict) -> list:
 def _transactions(league_id: str, through_week: int | None) -> list:
     """Compact waiver / free-agent transactions for weeks 1..through_week."""
     out = []
-    for wk in range(1, (through_week or 0) + 1):
-        txs, err = _get(f"/league/{league_id}/transactions/{wk}")
+    weeks = range(1, (through_week or 0) + 1)
+    with ThreadPoolExecutor(max_workers=8) as pool:  # one request per week, fetched in parallel
+        responses = list(pool.map(lambda wk: _get(f"/league/{league_id}/transactions/{wk}"), weeks))
+    for wk, (txs, err) in zip(weeks, responses):
         if err:
             log.warning("Transactions for week %s unavailable: %s", wk, err)
             continue

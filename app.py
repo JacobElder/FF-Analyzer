@@ -1,3 +1,4 @@
+import hmac
 import os
 
 import numpy as np
@@ -135,6 +136,17 @@ st.session_state.ai_provider = st.sidebar.radio(
     index=0 if st.session_state.ai_provider == "claude" else 1,
     format_func=lambda x: "Claude (Anthropic)" if x == "claude" else "Gemini (Google)",
 )
+# Optional password for the AI buttons (AI_PASSWORD in .env or Streamlit secrets), so a shared
+# copy of the app can hold an API key without strangers spending it. Unset = AI open, as locally.
+AI_PASSWORD = os.getenv("AI_PASSWORD", "")
+if AI_PASSWORD and not st.session_state.get("ai_unlocked"):
+    entered = st.sidebar.text_input("🔒 AI password", type="password", help="Unlocks the AI analysis buttons")
+    if entered and hmac.compare_digest(entered.encode(), AI_PASSWORD.encode()):
+        st.session_state.ai_unlocked = True
+        st.rerun()
+    elif entered:
+        st.sidebar.error("Wrong password.")
+
 if st.sidebar.button("🔄 Refresh data", help="Re-download stats, schedule, Sleeper players/injuries, projections and odds"):
     with st.spinner("Refreshing all data sources…"):
         refresh_all_data()
@@ -152,6 +164,10 @@ def _sync_state():
     """Process-wide auto-sync bookkeeping: last attempt time and last error per league."""
     return {"attempts": {}, "errors": {}}
 
+
+# Load the Sleeper player database first: the league syncs below (run in parallel) all need it,
+# and this way it's downloaded once instead of once per league
+_players_db, _name_index, _injury_map, _trade_pool = load_players_db()
 
 # Keep the default leagues current: re-sync any whose saved data is older than auto_sync_minutes
 _sync = _sync_state()
@@ -209,7 +225,6 @@ if _weekly_df.empty:
 _schedules_df = load_schedules()
 _next_games = load_next_games()
 _vegas_totals = load_vegas()
-_players_db, _name_index, _injury_map, _trade_pool = load_players_db()
 
 scoring = effective_scoring(current_data.get("scoring_settings"))
 roster_positions = current_data.get("roster_positions") or DEFAULT_ROSTER_POSITIONS
@@ -433,6 +448,9 @@ def candidate_notes(c: dict) -> str:
 
 def _ai_block(state_key: str, request_id, button_label: str, run):
     """AI button whose output survives reruns (keyed to the current request)."""
+    if AI_PASSWORD and not st.session_state.get("ai_unlocked"):
+        st.caption("🔒 Enter the AI password in the sidebar to use this.")
+        return
     if st.button(button_label, key=f"{state_key}_btn"):
         with st.spinner(f"Analyzing with {st.session_state.ai_provider}..."):
             st.session_state[state_key] = (request_id, run())
@@ -451,6 +469,7 @@ tab_roster, tab_waivers, tab_planner, tab_start_sit, tab_trade, tab_roster_mgmt 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — ROSTER
 # ════════════════════════════════════════════════════════════════════════════
+_INJURY_COL = {"Injury": st.column_config.TextColumn(width=110)}  # fits "Questionable"
 _SHORT_SLOT = {"SUPER_FLEX": "SFLEX", "WRRB_FLEX": "W/R", "REC_FLEX": "W/T", "IDP_FLEX": "IDP"}
 _SLOT_ORDER = {slot: i for i, slot in enumerate(dict.fromkeys(
     [s for s in roster_positions if s not in ("BN", "IR", "TAXI")] + ["BN", "IR", "Taxi"]))}
@@ -530,7 +549,7 @@ with tab_roster:
                 "Stats": stats_note(p, s),
             })
         df_roster = pd.DataFrame(rows)
-        st.dataframe(df_roster, hide_index=True, width="stretch")
+        st.dataframe(df_roster, hide_index=True, width="stretch", column_config=_INJURY_COL)
         if ctx:
             st.caption(f"Proj = 80% Sleeper projection + 20% this season's production, adjusted for byes, injuries "
                        f"(estimated return weeks) and matchup. ROS = sum over weeks {ctx.weeks[0]}–{ctx.weeks[-1]}.")
@@ -626,7 +645,7 @@ with tab_waivers:
                 "Injury": inj_for(p) or "",
                 "Implied Total": _vegas_totals.get(p.get("team")),
             })
-        st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
+        st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch", column_config=_INJURY_COL)
 
         st.divider()
         st.subheader("Player Deep Dive")
@@ -1215,7 +1234,7 @@ with tab_roster_mgmt:
                     "Injury": inj_for(t) or "",
                 })
             df_targets = pd.DataFrame(target_rows).sort_values("Need Score", ascending=False)
-            st.dataframe(df_targets, hide_index=True, width="stretch")
+            st.dataframe(df_targets, hide_index=True, width="stretch", column_config=_INJURY_COL)
 
             fig = px.bar(df_targets.head(10), x="Player", y=["Need Score", "Base Score"],
                          barmode="overlay", title="Need-Adjusted vs Base Waiver Score",

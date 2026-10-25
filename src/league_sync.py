@@ -7,6 +7,7 @@ re-sync on every Streamlit rerun; the last good copy keeps being used.
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from src.sleeper_integration import sync_sleeper_league
@@ -49,12 +50,20 @@ def auto_sync(username: str, league_ids: list, max_age_s: float, attempts: dict,
     errors = {}
     if not username:
         return errors
-    for lid in leagues_due(league_ids, max_age_s, attempts, now):
+    due = leagues_due(league_ids, max_age_s, attempts, now)
+    for lid in due:
         attempts[lid] = now
+
+    def attempt(lid):
         try:
-            data, err = sync_fn(username, lid)
+            return sync_fn(username, lid)
         except Exception as e:  # one bad league must not stop the others
-            data, err = None, f"Sync failed: {e}"
+            return None, f"Sync failed: {e}"
+
+    # Leagues sync in parallel (each is a dozen Sleeper requests); results are saved in order
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(attempt, due))
+    for lid, (data, err) in zip(due, results):
         if data:
             save_league(data)
         else:
