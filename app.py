@@ -320,7 +320,7 @@ def matchup_for(p) -> tuple[dict | None, dict]:
 def stats_note(p, s) -> str:
     if s["found"]:
         return ""
-    return "n/a (team D)" if p.get("position") == "DEF" else "⚠️ not found"
+    return "team D" if p.get("position") == "DEF" else "⚠️ not found"
 
 def player_context(p, s=None) -> dict:
     """Facts handed to the AI so it doesn't rely on stale training data."""
@@ -451,6 +451,7 @@ tab_roster, tab_waivers, tab_planner, tab_start_sit, tab_trade, tab_roster_mgmt 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — ROSTER
 # ════════════════════════════════════════════════════════════════════════════
+_SHORT_SLOT = {"SUPER_FLEX": "SFLEX", "WRRB_FLEX": "W/R", "REC_FLEX": "W/T", "IDP_FLEX": "IDP"}
 _SLOT_ORDER = {slot: i for i, slot in enumerate(dict.fromkeys(
     [s for s in roster_positions if s not in ("BN", "IR", "TAXI")] + ["BN", "IR", "Taxi"]))}
 
@@ -518,13 +519,14 @@ with tab_roster:
             s = roster_stats[p["name"]]
             next_g, m = matchup_for(p)
             rows.append({
-                **({"Slot": p.get("slot", "")} if has_slots else {}),
+                **({"Slot": _SHORT_SLOT.get(p.get("slot"), p.get("slot", ""))} if has_slots else {}),
                 "Player": p["name"], "Pos": p.get("position", ""), "Team": p.get("team", ""),
-                "Season PPG": s["season"]["ppg"], "Recent PPG": s["recent"]["ppg"],
+                "Season PPG": s["season"]["ppg"] or 0, "Recent PPG": s["recent"]["ppg"] or 0,
                 "Games": s["season"]["games"],
                 **({f"Proj Wk {week_now}": proj_now(p), "ROS Proj": ctx.ros_total(p)} if ctx else {}),
                 "Injury": inj_for(p) or "",
-                "Next Matchup": f"vs {next_g['opponent']} ({m['rank_label']})" if next_g else "—",
+                # Drop the "(top 25%)" detail so the column doesn't get cut off
+                "Next Matchup": f"vs {next_g['opponent']} ({m['rank_label'].split(' (')[0]})" if next_g else "—",
                 "Stats": stats_note(p, s),
             })
         df_roster = pd.DataFrame(rows)
