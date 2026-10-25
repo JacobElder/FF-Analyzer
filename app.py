@@ -116,7 +116,7 @@ def refresh_all_data():
     fetch_weekly_stats(force=True)
     fetch_schedules(force=True)
     fetch_all_players(force=True)
-    fetch_implied_totals(force=True)
+    fetch_implied_totals()  # not forced: odds requests count against a monthly quota, so keep the 1-hour cache
     for path in DATA_DIR.glob("projections_*.json"):  # re-fetched on demand
         path.unlink(missing_ok=True)
     st.cache_data.clear()
