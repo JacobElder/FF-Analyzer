@@ -148,6 +148,11 @@ class ValuationContext:
             return max(0.0, 8.0 + (total - 22.0) * 0.2) if total else None
         return None
 
+    def on_bye(self, p: dict, week: int) -> bool:
+        """His NFL team has a schedule and no game in `week`."""
+        team_sched = self.opponents.get(p.get("team"), {})
+        return bool(p.get("team") and team_sched and week not in team_sched)
+
     def week_values(self, p: dict) -> dict:
         """{week: projected points} for every valuation week."""
         key = p.get("player_id") or (p.get("name"), p.get("position"))
@@ -155,12 +160,11 @@ class ValuationContext:
             return self._cache[key]
 
         stats = self.index.get_player_stats(p)
-        team_sched = self.opponents.get(p.get("team"), {})
         status = self.injury(p)
         out_weeks = INJURY_WEEKS_OUT.get(status, 0)
         values = {}
         for w in self.weeks:
-            if not p.get("team") or (team_sched and w not in team_sched):
+            if not p.get("team") or self.on_bye(p, w):
                 values[w] = 0.0  # bye week or no NFL team
                 continue
             covered = self.covers(w)
@@ -333,8 +337,10 @@ def lineup_suggestions(roster: list, ctx: ValuationContext, roster_positions: li
         status = ctx.injury(out)
         if status in INJURY_WEEKS_OUT or status == "Doubtful":
             reason = f"{out['name']} is {status}"
-        elif val.get(out["name"], 0) == 0 and out.get("team"):
+        elif val.get(out["name"], 0) == 0 and ctx.on_bye(out, week):
             reason = f"{out['name']} is on bye"
+        elif val.get(out["name"], 0) == 0:
+            reason = f"{out['name']} isn't projected to play"
         else:
             reason = "Higher projection"
         swaps.append({"slot": out.get("slot"), "out": out["name"], "in": inn,

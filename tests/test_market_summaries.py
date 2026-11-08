@@ -109,3 +109,11 @@ def test_lineup_suggestions_flag_bye_and_empty_slot():
     assert reasons.get("wr") == "wr is on bye"
     assert any(s["reason"] == "Empty starting slot" for s in out["swaps"])
     assert lineup_suggestions(roster, _ctx(PTS).__class__(**{**_ctx(PTS).__dict__, "weeks": []}))["swaps"] == []
+
+
+def test_lineup_suggestions_unprojected_starter_is_not_called_on_bye():
+    # His team plays this week, but Sleeper's projections leave him out, so he's valued at 0
+    roster = [_p("qb", "QB", slot="QB"), _p("rb", "RB", slot="RB"), _p("wr", "WR", slot="WR"),
+              _p("te", "TE", slot="TE"), _p("wr2", "WR")]
+    out = lineup_suggestions(roster, _ctx({k: v for k, v in PTS.items() if k != "wr"}), POSITIONS)
+    assert {s["out"]: s["reason"] for s in out["swaps"]}["wr"] == "wr isn't projected to play"

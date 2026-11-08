@@ -214,6 +214,18 @@ def test_in_season_league_renders_every_tab(leagues_dir):
     assert at.sidebar.selectbox[0].value == "111"
 
 
+def test_current_week_projections_stay_live_after_thursday_stats(monkeypatch, leagues_dir):
+    # nflverse has a game from the current week (Thursday night): that week must not be cached as final
+    calls = {}
+    monkeypatch.setattr(src.wrangler, "fetch_weekly_stats",
+                        lambda *a, **k: pd.concat([_weekly_stats(), _weekly_stats().head(1).assign(week=WEEK)]))
+    monkeypatch.setattr(src.projections, "fetch_week_projections", lambda season, week, completed=False, **k: (
+        calls.__setitem__(week, completed) or {pid: {"pts_ppr": float(v)} for pid, v in PROJ.items()}))
+    sm.save_league(_league())
+    _run()
+    assert calls[WEEK] is False and not any(calls.values())
+
+
 def test_start_sit_compare(leagues_dir):
     sm.save_league(_league())
     at = _run()

@@ -100,7 +100,9 @@ def load_context(key: tuple, _index, _matchups, _vegas, _players_db, _injury_map
     """
     _, _, scoring_items, season, week, playoff_start = key
     weeks = fantasy_weeks(week, playoff_start)
-    proj = Projections(int(season), weeks, dict(scoring_items), completed_through=_index.last_week) if weeks else None
+    # Only weeks before the current one are final. nflverse has stats for the current week as soon as
+    # Thursday's game is played, so its last week would freeze this week's projections mid-week.
+    proj = Projections(int(season), weeks, dict(scoring_items), completed_through=int(week) - 1) if weeks else None
     return ValuationContext(_index, proj, team_week_opponents(load_schedules()), _matchups, _injury_map, weeks,
                             _vegas, _players_db)
 
