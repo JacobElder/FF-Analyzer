@@ -50,8 +50,9 @@ def test_without_rivals_bids_are_uncontested_minimums():
     analysis = analyze_waiver_pool(ROSTER, POOL, ctx, _league(min_bid=1, rivals=False), {}, 50, POSITIONS)
     for c in analysis["candidates"]:
         if c["gain_total"] > 0:
-            assert c["suggested_bid"] == min(max(1, c["max_pay"] // 2), 50)
-            assert not c["p_win_known"] and c["p_win"] == 0.5
+            assert c["suggested_bid"] == 1  # uncontested: the league minimum
+            assert c["p_win_known"] and c["p_win"] == 1.0 and c["contested"] is False
+            assert "not modeled" not in c["bid_note"]
 
 
 def test_lower_ranked_candidates_get_placeholder_odds():

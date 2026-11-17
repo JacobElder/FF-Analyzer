@@ -97,13 +97,16 @@ def bid_profile(transactions: list, budget_total: float) -> dict:
 
 # ── Valuing a bid ────────────────────────────────────────────────────────────
 
-def typical_gain(gains: list, n_weeks: int) -> float:
+def typical_gain(gains: list, n_weeks: int, weight_sum: float | None = None) -> float:
     """
     Rest-of-season gain of a 'typical good add': the median of this week's 10 best
-    positive gains, but never less than the season benchmark (TYPICAL_ADD_PER_WEEK).
+    positive gains, but never less than the season benchmark (TYPICAL_ADD_PER_WEEK
+    per remaining week). When the gains are week-weighted (e.g. playoff weeks by the
+    chance of being there), pass `weight_sum` = the sum of those week weights so the
+    benchmark is weighted the same way.
     """
     top = sorted((g for g in gains if g > 0), reverse=True)[:10]
-    floor = TYPICAL_ADD_PER_WEEK * max(n_weeks, 1)
+    floor = TYPICAL_ADD_PER_WEEK * max(n_weeks if weight_sum is None else weight_sum, 1)
     return max(median(top), floor) if top else floor
 
 
@@ -144,10 +147,15 @@ def market_price_pct(profile: dict, ratio: float) -> float | None:
 
 
 def rival_interest(add: dict, rivals: list, ctx, players_db: dict, roster_positions: list,
-                   typical: float, profile: dict, trend_count: int = 0, rival_weights: dict | None = None) -> list:
+                   typical: float, profile: dict, trend_count: int = 0, rival_weights: dict | None = None,
+                   rival_typicals: dict | None = None, faab: bool = True) -> list:
     """
     Each rival's lineup gain from `add` and an estimated bid. `rival_weights`
-    ({roster_id: week weights}) values each rival's gain by its own playoff chances.
+    ({roster_id: week weights}) values each rival's gain by its own playoff chances;
+    `rival_typicals` ({roster_id: typical add gain}, weighted the same way) prices each
+    rival against its own typical add instead of yours. IR and taxi players never
+    count toward a rival's lineup or roster limit. Without FAAB (`faab=False`)
+    every est_bid is 0 — only interest matters.
     """
     weeks_left = len(ctx.weeks)
     trend_mult = 1 + min(0.5, (trend_count or 0) / 4000)  # league-wide add frenzy → bids run hotter
@@ -155,23 +163,25 @@ def rival_interest(add: dict, rivals: list, ctx, players_db: dict, roster_positi
     for r in rivals:
         roster = r.get("_roster")
         if roster is None:
-            reserve = set(r.get("reserve") or [])
-            roster = [{**sleeper_to_player(pid, players_db.get(pid, {})), "slot": "IR" if pid in reserve else "BN"}
+            reserve, taxi = set(r.get("reserve") or []), set(r.get("taxi") or [])
+            roster = [{**sleeper_to_player(pid, players_db.get(pid, {})),
+                       "slot": "IR" if pid in reserve else ("TAXI" if pid in taxi else "BN")}
                       for pid in r.get("players") or []]
             r["_roster"] = roster
             r["_base"] = lineup_totals(roster, ctx, roster_positions)
         ev = evaluate_add(add, roster, ctx, roster_positions, base_totals=r["_base"], max_drop_candidates=4,
                           weights=(rival_weights or {}).get(r["roster_id"]))
-        per_week = ev["gain_total"] / max(weeks_left, 1)
+        per_week = ev["gain_per_week"]  # weighted gain ÷ weight of the weeks it counts (2-week horizon for DEF/K)
         aggression = profile["by_roster"].get(r["roster_id"], {}).get("aggression", 1.0)
         est = 0
-        if per_week >= MIN_INTEREST_PER_WEEK:
-            market = market_price_pct(profile, ev["gain_total"] / typical if typical > 0 else 1.0)
+        if per_week >= MIN_INTEREST_PER_WEEK and faab:
+            own_typical = (rival_typicals or {}).get(r["roster_id"], typical)
+            market = market_price_pct(profile, ev["gain_total"] / own_typical if own_typical > 0 else 1.0)
             if market is not None:
                 # Anchor to what this league actually pays for an add of this size
                 raw = market * profile["budget_total"]
             else:
-                raw = max_bid(ev["gain_total"], typical, r["faab_remaining"], weeks_left)
+                raw = max_bid(ev["gain_total"], own_typical, r["faab_remaining"], weeks_left)
             est = min(r["faab_remaining"], round(raw * aggression * trend_mult))
         out.append({
             "roster_id": r["roster_id"], "team": r["team_name"],
@@ -182,18 +192,40 @@ def rival_interest(add: dict, rivals: list, ctx, players_db: dict, roster_positi
     return sorted(out, key=lambda x: -x["est_bid"])
 
 
+def rivals_ahead(rivals: list, my_waiver_position) -> int:
+    """Interested rivals ahead of you in waiver priority (an unknown position counts as ahead)."""
+    return sum(1 for r in rivals if r["interested"] and (
+        my_waiver_position is None or r.get("waiver_position") is None or r["waiver_position"] < my_waiver_position))
+
+
+def priority_win_prob(rivals: list, my_waiver_position) -> float:
+    """
+    P(win) in a league without FAAB: claims go by waiver priority, so you get the
+    player unless an interested rival ahead of you in the order claims him —
+    (1 − RIVAL_BID_PROB)^rivals_ahead(...).
+    """
+    return round((1 - RIVAL_BID_PROB) ** rivals_ahead(rivals, my_waiver_position), 3)
+
+
 def win_curve(rivals: list, my_waiver_position, max_level: int, seed_key: str = "",
-              market_price: float | None = None, n_sims: int = 3000) -> list:
+              market_price: float | None = None, n_sims: int = 3000, faab: bool = True) -> list:
     """
     [(bid, P(win))] for bids 0..max_level. FAAB ties go to the better waiver position.
 
     With league history (market_price = the league's typical WINNING bid for an
-    add of this size), the top competing bid is simulated directly:
-    contested with probability 1 − (1 − RIVAL_BID_PROB)^interested, and then
+    add of this size), the top competing bid is simulated directly: each
+    interested rival claims with probability RIVAL_BID_PROB; in each draw the
+    claimant with the highest (noisy) estimated bid holds the top bid, which is
     market_price × (partly) the most aggressive interested rival's aggression × noise,
-    capped at the richest interested rival's budget. Without history, each
-    interested rival's own estimated bid is simulated and the highest one wins.
+    capped at that holder's budget, and ties are broken by THAT holder's waiver
+    position. Without history, each interested rival's own estimated bid is
+    simulated and the highest one wins.
+
+    Without FAAB (`faab=False`) the curve is the single point
+    [(0, priority_win_prob(...))].
     """
+    if not faab:
+        return [(0, priority_win_prob(rivals, my_waiver_position))]
     max_level = max(0, int(max_level))
     bidders = [r for r in rivals if r["interested"] and r["budget"] > 0]
     if not bidders:
@@ -201,12 +233,16 @@ def win_curve(rivals: list, my_waiver_position, max_level: int, seed_key: str = 
     rng = np.random.default_rng(zlib.crc32(seed_key.encode()))
 
     if market_price is not None:
-        p_contested = 1 - (1 - RIVAL_BID_PROB) ** len(bidders)
+        k = len(bidders)
+        claims = rng.random((n_sims, k)) < RIVAL_BID_PROB
+        strength = np.array([max(r["est_bid"], 0.5) for r in bidders]) * rng.lognormal(0, RIVAL_BID_NOISE, (n_sims, k))
+        holder = np.where(claims, strength, -1.0).argmax(axis=1)  # who holds the top bid in each draw
+        budgets = np.array([float(r["budget"]) for r in bidders])
+        positions = np.array([float(r.get("waiver_position") or 99) for r in bidders])
         aggression = 1 + (max(r["aggression"] for r in bidders) - 1) * AGGRESSION_WEIGHT
-        cap = max(r["budget"] for r in bidders)
         amount = np.round(max(market_price * aggression, 0.5) * rng.lognormal(0, RIVAL_BID_NOISE, n_sims))
-        best_bid = np.where(rng.random(n_sims) < p_contested, np.minimum(amount, cap), -1.0)
-        best_pos = np.full(n_sims, float(min((r.get("waiver_position") or 99) for r in bidders)))
+        best_bid = np.where(claims.any(axis=1), np.minimum(amount, budgets[holder]), -1.0)
+        best_pos = positions[holder]
     else:
         best_bid = np.full(n_sims, -1.0)
         best_pos = np.full(n_sims, 99.0)
@@ -231,28 +267,37 @@ def recommend_bid(max_pay: int, curve: list, min_bid: int = 0, budget: int | Non
     """
     Cheapest bid reaching TARGET_WIN_PROB, capped at max_pay. Never suggests
     more than `budget`, and never a non-zero bid for a player worth $0 to you.
+
+    Returns {"suggested", "p_win", "likely_needed", "contested", "note",
+    "below_value", "excluded"}: `below_value` is True when the suggestion is more
+    than he's worth to you (the league minimum exceeds max_pay); `excluded` is True
+    when no legal bid is worth making ($0 suggested but the league minimum is
+    higher), so the claims planner skips him.
     """
     p_at = dict(curve)
     contested = any(p < 1.0 for _, p in curve)
     if budget is not None and budget < min_bid:
         return {"suggested": 0, "p_win": 0.0, "likely_needed": None, "contested": contested,
-                "note": "Not enough FAAB left for the league's minimum bid."}
+                "note": "Not enough FAAB left for the league's minimum bid.", "below_value": False,
+                "excluded": True}
     if not contested:
         return {"suggested": min_bid, "p_win": 1.0, "likely_needed": min_bid, "contested": False,
-                "note": "No other team gains much from him — a minimum bid should do."}
+                "note": "No other team gains much from him — a minimum bid should do.",
+                "below_value": min_bid > max_pay, "excluded": False}
     likely = next((b for b, p in curve if p >= 0.5), None)
     target = next((b for b, p in curve if p >= TARGET_WIN_PROB), None)
     if target is not None and target <= max_pay:
         bid, note = max(target, min_bid), f"Cheapest bid with a {TARGET_WIN_PROB:.0%}+ chance to win."
     elif max_pay <= 0:
-        bid, note = 0, "Not worth a bid for your roster."
+        return {"suggested": 0, "p_win": p_at.get(0, 0.0), "likely_needed": likely, "contested": True,
+                "note": "Not worth a bid for your roster.", "below_value": False, "excluded": min_bid > 0}
     else:
         bid = max(min(max_pay, curve[-1][0]), min_bid)
         note = "Winning likely costs more than he's worth to you — bid your max only if you want a shot."
     if budget is not None:
         bid = min(bid, budget)
     return {"suggested": int(bid), "p_win": p_at.get(bid, 0.0), "likely_needed": likely,
-            "contested": True, "note": note}
+            "contested": True, "note": note, "below_value": bid > max_pay, "excluded": False}
 
 
 # ── Claims planner ───────────────────────────────────────────────────────────
@@ -267,8 +312,13 @@ def plan_claims(candidates: list, budget: int, open_spots: int = 0, max_claims: 
     assuming the earlier ones succeed: `reevaluate(candidate, plan_so_far)`
     returns the candidate's drop options against the roster after those
     claims. Without it, each claim's standalone gain is used.
+
+    Candidates flagged `excluded`, and any bid below the candidate's `min_bid`,
+    never make the plan. Each claim is priced against the budget still unspent,
+    so one that no longer fits at its standalone bid is re-bid lower if it can be.
     """
-    pool = sorted((c for c in candidates if c["gain_total"] > 0 and c["suggested_bid"] <= budget),
+    pool = sorted((c for c in candidates if c["gain_total"] > 0 and c["suggested_bid"] <= budget
+                   and not c.get("excluded")),
                   key=lambda c: -c["p_win"] * c["gain_total"])[:pool_size]
     plan, used_drops, spent = [], set(), 0
 
@@ -280,14 +330,14 @@ def plan_claims(candidates: list, budget: int, open_spots: int = 0, max_claims: 
                      if (o["name"] is None and open_spots > 0)
                      or (o["name"] and o["name"] not in used_drops and o["name"] not in planned_adds)), None)
 
-    def reprice(c, gain):
-        """Bid and P(win) when the claim is worth only `gain` (after earlier claims)."""
-        if gain >= c["gain_total"] or not c.get("max_pay"):
+    def reprice(c, gain, remaining):
+        """Bid and P(win) when the claim is worth only `gain` (after earlier claims) with `remaining` FAAB."""
+        if not c.get("max_pay") or (gain >= c["gain_total"] and c["suggested_bid"] <= remaining):
             return c["suggested_bid"], c["p_win"]
-        cond_max = int(c["max_pay"] * gain / c["gain_total"])
+        cond_max = int(c["max_pay"] * min(gain / c["gain_total"], 1.0))
         if not c.get("curve"):
             return min(c["suggested_bid"], max(cond_max, c.get("min_bid", 0))), c["p_win"]
-        rec = recommend_bid(cond_max, c["curve"], c.get("min_bid", 0), budget)
+        rec = recommend_bid(cond_max, c["curve"], c.get("min_bid", 0), remaining)
         return rec["suggested"], rec["p_win"]
 
     while pool and len(plan) < max_claims:
@@ -296,8 +346,8 @@ def plan_claims(candidates: list, budget: int, open_spots: int = 0, max_claims: 
             o = best_option(c)
             if not o or o["gain_total"] <= 0:
                 continue
-            bid, p_win = reprice(c, o["gain_total"])
-            if spent + bid > budget:
+            bid, p_win = reprice(c, o["gain_total"], budget - spent)
+            if spent + bid > budget or bid < c.get("min_bid", 0):
                 continue
             scored.append((p_win * o["gain_total"], c, o, bid, p_win))
         if not scored:

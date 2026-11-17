@@ -239,6 +239,16 @@ def optimal_lineup(players: list, roster_positions: list | None = None) -> dict:
     return {"starters": starters, "total": round(sum(s["value"] for s in starters), 2)}
 
 
+def _verdict(change: float) -> str:
+    return "ACCEPT" if change >= 0.02 else ("DECLINE" if change <= -0.02 else "NEGOTIATE")
+
+
+def _pct_change(before: float, after: float) -> float:
+    if before > 0:
+        return (after - before) / before
+    return 1.0 if after > before else (-1.0 if after < before else 0.0)  # empty or stat-less lineup
+
+
 def score_trade(
     roster: list,
     giving: list,
@@ -246,34 +256,62 @@ def score_trade(
     stats_by_name: dict,
     replacement_levels: dict | None = None,
     roster_positions: list | None = None,
+    ctx=None,
 ) -> dict:
     """
     Evaluate a trade by its effect on your best starting lineup.
 
-    roster:    your current roster [{name, position}]
+    roster:    your current roster [{name, position, slot?}]
     giving:    names from your roster you send away
     receiving: [{name, position}] players you get
     stats_by_name: {name: stats} for everyone involved
+    ctx:       optional ValuationContext (src.valuation); when given, the verdict
+               comes from rest-of-season projected lineup totals instead of history.
 
-    Primary metric: change in optimal-lineup adj value (so a 2-for-1 is judged
-    by what actually starts, not by summed points). Also reports value over
-    replacement (VORP) per player. Without a roster, falls back to comparing
-    VORP totals.
+    IR/TAXI players (slot in valuation.NON_ROSTER_SLOTS) never count toward a lineup
+    or the roster limit. If the trade leaves more players than the roster limit
+    (the non-IR/TAXI slots in `roster_positions`, only enforced when it's given)
+    and more than you started with, the least valuable players are dropped from
+    the after roster first.
 
-    Verdict: lineup change ≥ +2% ACCEPT, ≤ −2% DECLINE, else NEGOTIATE.
+    History basis (no ctx): change in optimal-lineup adj value per week (so a 2-for-1
+    is judged by what actually starts, not by summed points). Without a roster,
+    falls back to comparing VORP totals.
+
+    Projection basis (ctx): change in the sum over ctx.weeks of the best lineup
+    each week (valuation.lineup_totals), with forced drops chosen to cost the
+    fewest projected points.
+
+    Verdict: change ≥ +2% ACCEPT, ≤ −2% DECLINE, else NEGOTIATE.
+
+    Returns (always): "you_give", "you_receive" ({name: {adj_value, surplus, position}}),
+      "give_vorp", "recv_vorp", "method" ("lineup" | "vorp"), "basis" ("history" |
+      "projection"), "delta", "delta_pct", "verdict" (primary, from `basis`),
+      "history_delta", "history_delta_pct", "history_verdict" (history-based figures),
+      "excluded" (IR/TAXI names left out of both lineups), "dropped" (names cut to fit
+      the roster limit), "roster_limit" (int or None).
+    With a roster ("lineup"): "before", "after" (history optimal lineups, {starters, total}).
+    With ctx and a roster ("projection"): "ros_before", "ros_after" ({week: lineup pts}),
+      "ros_delta" (season total change), "ros_delta_per_week"; "delta" is then
+      ros_delta_per_week and "delta_pct" the season-total % change.
     """
+    from src.valuation import NON_ROSTER_SLOTS, lineup_totals, roster_limit
+
     def valued(p):
         v = player_value(stats_by_name.get(p["name"], {}))["adj_value"]
         return {"name": p["name"], "position": p.get("position", ""), "value": v,
                 "surplus": round(max(0.0, v - _replacement(p.get("position", ""), replacement_levels)), 2)}
 
     give_set = set(giving)
+    excluded = [p["name"] for p in roster if p.get("slot") in NON_ROSTER_SLOTS and p["name"] not in give_set]
+    active = [p for p in roster if p.get("slot") not in NON_ROSTER_SLOTS]
     roster_vals = [valued(p) for p in roster]
     give_vals = [v for v in roster_vals if v["name"] in give_set]
     recv_vals = [valued(p) for p in receiving]
 
     give_vorp = round(sum(v["surplus"] for v in give_vals), 2)
     recv_vorp = round(sum(v["surplus"] for v in recv_vals), 2)
+    limit = roster_limit(roster_positions) if roster_positions else None
 
     result = {
         "you_give": {v["name"]: {"adj_value": v["value"], "surplus": v["surplus"], "position": v["position"]}
@@ -282,32 +320,70 @@ def score_trade(
                         for v in recv_vals},
         "give_vorp": give_vorp,
         "recv_vorp": recv_vorp,
+        "excluded": excluded,
+        "dropped": [],
+        "roster_limit": limit,
     }
 
-    if roster_vals:
-        before = optimal_lineup(roster_vals, roster_positions)
-        kept = [v for v in roster_vals if v["name"] not in give_set]
-        kept_names = {v["name"] for v in kept}
-        after_pool = kept + [v for v in recv_vals if v["name"] not in kept_names]  # never count a player twice
-        after = optimal_lineup(after_pool, roster_positions)
-        delta = after["total"] - before["total"]
-        if before["total"] > 0:
-            delta_pct = delta / before["total"]
-        else:  # empty or stat-less lineup: any gain is a clear improvement
-            delta_pct = 1.0 if delta > 0 else (-1.0 if delta < 0 else 0.0)
-        result.update({
-            "method": "lineup",
-            "before": before, "after": after,
-            "delta": round(delta, 2), "delta_pct": round(delta_pct, 4),
-        })
-        change = delta_pct
-    else:
+    if not roster_vals:
         diff = recv_vorp - give_vorp
-        base = max(give_vorp, recv_vorp, 1.0)
-        result.update({"method": "vorp", "delta": round(diff, 2), "delta_pct": round(diff / base, 4)})
-        change = diff / base
+        change = diff / max(give_vorp, recv_vorp, 1.0)
+        result.update({"method": "vorp", "basis": "history", "delta": round(diff, 2),
+                       "delta_pct": round(change, 4), "verdict": _verdict(change),
+                       "history_delta": round(diff, 2), "history_delta_pct": round(change, 4),
+                       "history_verdict": _verdict(change)})
+        return result
 
-    result["verdict"] = "ACCEPT" if change >= 0.02 else ("DECLINE" if change <= -0.02 else "NEGOTIATE")
+    # Rosters before / after (active players only; a received player you already own counts once)
+    kept = [p for p in active if p["name"] not in give_set]
+    kept_names = {p["name"] for p in kept}
+    after_players = kept + [{**p, "slot": "BN"} for p in receiving if p["name"] not in kept_names]
+    cap = max(limit, len(active)) if limit is not None else None
+    excess = max(0, len(after_players) - cap) if cap is not None else 0
+
+    def history_lineup(players):
+        return optimal_lineup([valued(p) for p in players], roster_positions)
+
+    if ctx is not None:
+        def season_total(players):
+            return sum(lineup_totals(players, ctx, roster_positions).values())
+        for _ in range(excess):  # cut whoever costs the fewest projected lineup points
+            options = sorted(after_players, key=ctx.ros_total)[:6]
+            cut = max(options, key=lambda d: season_total([p for p in after_players if p is not d]))
+            after_players = [p for p in after_players if p is not cut]
+            result["dropped"].append(cut["name"])
+    else:
+        for _ in range(excess):  # cut the least valuable bench player (a starter only if all start)
+            starting = {s["name"] for s in history_lineup(after_players)["starters"]}
+            cut = min(after_players, key=lambda p: (p["name"] in starting, valued(p)["value"]))
+            after_players = [p for p in after_players if p is not cut]
+            result["dropped"].append(cut["name"])
+
+    before, after = history_lineup(active), history_lineup(after_players)
+    h_delta = after["total"] - before["total"]
+    h_pct = _pct_change(before["total"], after["total"])
+    result.update({
+        "method": "lineup", "before": before, "after": after,
+        "history_delta": round(h_delta, 2), "history_delta_pct": round(h_pct, 4),
+        "history_verdict": _verdict(h_pct),
+    })
+
+    if ctx is None:
+        result.update({"basis": "history", "delta": round(h_delta, 2), "delta_pct": round(h_pct, 4),
+                       "verdict": _verdict(h_pct)})
+        return result
+
+    ros_before = lineup_totals(active, ctx, roster_positions)
+    ros_after = lineup_totals(after_players, ctx, roster_positions)
+    total_before, total_after = sum(ros_before.values()), sum(ros_after.values())
+    ros_delta = total_after - total_before
+    pct = _pct_change(total_before, total_after)
+    per_week = ros_delta / max(len(ctx.weeks), 1)
+    result.update({
+        "basis": "projection", "ros_before": ros_before, "ros_after": ros_after,
+        "ros_delta": round(ros_delta, 2), "ros_delta_per_week": round(per_week, 2),
+        "delta": round(per_week, 2), "delta_pct": round(pct, 4), "verdict": _verdict(pct),
+    })
     return result
 
 
