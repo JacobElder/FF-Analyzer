@@ -50,8 +50,34 @@ def fetch_week_projections(season: int, week: int, completed: bool = False, forc
         return read_json(path) if path.exists() else {}
 
 
+# Kicker split misses in Sleeper's projected stat lines (there is no aggregate "fgmiss")
+_FGMISS_SPLITS = ("fgmiss_0_19", "fgmiss_20_29", "fgmiss_30_39", "fgmiss_40_49", "fgmiss_50p")
+
+
+def _num(x) -> bool:
+    return isinstance(x, (int, float))
+
+
+def _derive_kicker_stats(stats: dict, scoring: dict) -> dict:
+    """
+    Fill league kicker keys Sleeper's projections lack from the ones they have:
+    fgmiss = sum of the split misses; fgm_50_59 = fgm_50p (projections don't split
+    50-59 / 60+, so long makes take the 50-59 weight).
+    """
+    extra = {}
+    if "fgmiss" in scoring and not _num(stats.get("fgmiss")):
+        splits = [stats[k] for k in _FGMISS_SPLITS if _num(stats.get(k))]
+        if splits:
+            extra["fgmiss"] = sum(splits)
+    if ("fgm_50_59" in scoring and not _num(stats.get("fgm_50_59")) and not _num(stats.get("fgm_60p"))
+            and _num(stats.get("fgm_50p"))):
+        extra["fgm_50_59"] = stats["fgm_50p"]
+    return {**stats, **extra} if extra else stats
+
+
 def score_projection(stats: dict, scoring: dict) -> float:
     """Projected fantasy points: projected stats · league scoring weights."""
+    stats = _derive_kicker_stats(stats, scoring)
     pts = sum(stats[k] * w for k, w in scoring.items() if k in stats and isinstance(stats[k], (int, float)))
     if pts == 0:
         # League scoring lacks the relevant keys (e.g. no DEF keys) — use Sleeper's own total
