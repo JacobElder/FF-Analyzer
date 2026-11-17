@@ -134,7 +134,7 @@ make 30 AI requests, and the same question isn't sent twice.
 
 ## Deployment
 
-Live at **https://jelderffanalyzer.streamlit.app** (Streamlit Community Cloud, public repo, Python 3.12).
+Live at **https://jeffanalyzer.streamlit.app** (Streamlit Community Cloud, public repo, Python 3.14).
 Every push to `main` redeploys it. Secrets are set in the app's **⋮ → Settings → Secrets** (TOML format,
 values in quotes); root-level secrets reach the app as environment variables.
 
