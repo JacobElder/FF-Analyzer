@@ -11,16 +11,19 @@ NFL weekly stats (nflverse) and the per-player stats index.
 
 import logging
 from datetime import date
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
+import requests
 
 from src.players import normalize_name, norm_team
-from src.storage import data_path, is_fresh, write_parquet_atomic
+from src.storage import DataUnavailable, data_path, is_fresh, write_parquet_atomic
 
 log = logging.getLogger(__name__)
 
 CACHE_TTL = 86400  # 24 hours
+DOWNLOAD_TIMEOUT = (10, 60)  # (connect, read) seconds
 RECENT_WEEKS = 6   # "recent form" window; backtested (see src/backtest.py)
 NFLVERSE_WEEKLY_URL = "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{year}.parquet"
 
@@ -46,12 +49,24 @@ def _prepare(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(["player_id", "week"]).reset_index(drop=True)
 
 
+def download_parquet(url: str, timeout=DOWNLOAD_TIMEOUT) -> pd.DataFrame:
+    """GET a parquet file with a timeout (pd.read_parquet(url) has none)."""
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return pd.read_parquet(BytesIO(r.content))
+
+
 def _load_season(year: int, force: bool) -> pd.DataFrame:
+    """
+    One season's weekly stats. Falls back to a stale cache when the download
+    fails; raises DataUnavailable when there is no cached copy either (so a
+    caller like Streamlit's cache doesn't keep an empty result for hours).
+    """
     path = data_path(f"weekly_stats_{year}.parquet")
     if not force and is_fresh(path, CACHE_TTL):
         return pd.read_parquet(path)
     try:
-        df = pd.read_parquet(NFLVERSE_WEEKLY_URL.format(year=year))
+        df = download_parquet(NFLVERSE_WEEKLY_URL.format(year=year))
         if not df.empty:
             write_parquet_atomic(df, path)
         return df
@@ -60,17 +75,22 @@ def _load_season(year: int, force: bool) -> pd.DataFrame:
         if path.exists():  # stale cache beats nothing
             log.warning("nflverse: using stale cache for %s", year)
             return pd.read_parquet(path)
-        return pd.DataFrame()
+        raise DataUnavailable(f"Couldn't download NFL stats for {year}: {e}") from e
 
 
 def fetch_weekly_stats(year: int | None = None, force: bool = False) -> pd.DataFrame:
     """
     Regular-season weekly player stats for `year` (default: current season),
     falling back to the previous season if the current one has no data yet.
+    Raises DataUnavailable when neither season can be loaded.
     """
     if year is None:
         year = current_nfl_season()
-    df = _prepare(_load_season(year, force))
+    try:
+        df = _prepare(_load_season(year, force))
+    except DataUnavailable as e:
+        log.warning("%s; trying %s", e, year - 1)  # e.g. a new season's file isn't published yet
+        df = pd.DataFrame()
     if df.empty:
         df = _prepare(_load_season(year - 1, force))
     return df

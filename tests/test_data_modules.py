@@ -76,8 +76,7 @@ def test_load_season_uses_stale_cache_when_download_fails(monkeypatch):
     cached = _df([("00-1", "A", "WR", "NYJ", 1, 5.0)])
     path = wrangler.data_path("weekly_stats_2025.parquet")
     cached.to_parquet(path)
-    monkeypatch.setattr(wrangler.pd, "read_parquet",
-                        lambda src, *a, **k: pd.DataFrame(cached) if str(src) == str(path) else (_ for _ in ()).throw(OSError("down")))
+    monkeypatch.setattr(wrangler, "download_parquet", lambda url: (_ for _ in ()).throw(OSError("down")))
     assert len(wrangler._load_season(2025, force=True)) == 1
 
 

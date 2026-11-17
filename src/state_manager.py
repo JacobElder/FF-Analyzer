@@ -35,7 +35,7 @@ def list_leagues() -> list[tuple[str, str]]:
         key = path.stem
         try:
             data = read_json(path)
-        except (OSError, ValueError):
+        except OSError:
             continue
         if not isinstance(data, dict):
             continue
@@ -60,7 +60,7 @@ def load_league(key: str) -> dict:
         return _empty_league(key)
     try:
         data = read_json(path)
-    except (OSError, ValueError) as e:
+    except OSError as e:  # corrupt JSON reads as None (see read_json) and is rejected below
         log.warning("Could not read league file %s: %s", path.name, e)
         return _empty_league(key)
     if not isinstance(data, dict):

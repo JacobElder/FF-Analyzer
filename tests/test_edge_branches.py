@@ -3,6 +3,7 @@
 import json
 import sys
 import types
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -231,10 +232,11 @@ def test_vegas_partial_markets_are_skipped():
              {"key": "totals", "outcomes": [{"name": "Under", "point": 40}, {"name": "Over", "point": 44}]},
              {"key": "spreads", "outcomes": [{"name": "Miami Dolphins", "point": 3},
                                              {"name": "Buffalo Bills", "point": -3}]}]
-    assert vegas.parse_implied_totals([game(noisy)]) == {"BUF": 23.5, "MIA": 20.5}
-    assert vegas.parse_implied_totals([{**game([]), "bookmakers": []}]) == {}
+    now = datetime(2026, 9, 30, tzinfo=timezone.utc)  # the NFL week containing Oct 1
+    assert vegas.parse_implied_totals([game(noisy)], now) == {"BUF": 23.5, "MIA": 20.5}
+    assert vegas.parse_implied_totals([{**game([]), "bookmakers": []}], now) == {}
     totals_only = [{"key": "totals", "outcomes": [{"name": "Over", "point": 44}]}]
-    assert vegas.parse_implied_totals([game(totals_only)]) == {}
+    assert vegas.parse_implied_totals([game(totals_only)], now) == {}
 
 
 # ── waiver pipeline ──────────────────────────────────────────────────────────

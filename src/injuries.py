@@ -12,6 +12,24 @@ INACTIVE_STATUSES = {"Out", "IR", "PUP", "Sus", "COV", "DNR", "NFI"}
 
 GAME_STATUS_ORDER = {"Out": 4, "Doubtful": 3, "Questionable": 2, "Probable": 1}
 
+# Sleeper's roster `status` → injury code, used when `injury_status` is empty
+# (players placed on a reserve list often carry only this)
+ROSTER_STATUS_MAP = {
+    "Injured Reserve": "IR", "IR": "IR",
+    "Physically Unable to Perform": "PUP", "PUP": "PUP",
+    "Suspended": "Sus", "Sus": "Sus",
+    "Non Football Injury": "NFI", "Non-Football Injury": "NFI", "NFI": "NFI",
+    "Reserve/COVID-19": "COV", "COV": "COV",
+}
+
+
+def player_injury_status(p_info: dict) -> str | None:
+    """Sleeper's injury_status, else a reserve-list `status` (IR, PUP, suspended…); None if healthy."""
+    status = p_info.get("injury_status")
+    if status and status != "NA":
+        return status
+    return ROSTER_STATUS_MAP.get(p_info.get("status") or "")
+
 
 def build_injury_map(players_db: dict) -> dict:
     by_id, by_name, name_counts = {}, {}, {}
@@ -19,11 +37,11 @@ def build_injury_map(players_db: dict) -> dict:
         if p_info.get("position") not in RELEVANT_POSITIONS:
             continue
         key = normalize_name(sleeper_display_name(p_info))
-        status = p_info.get("injury_status")
+        status = player_injury_status(p_info)
         if p_info.get("active") is False and not status:
             continue  # a retired namesake shouldn't make an active player's name ambiguous
         name_counts[key] = name_counts.get(key, 0) + 1
-        if status and status != "NA":
+        if status:
             by_id[p_id] = status
             by_name[key] = status
     # Drop ambiguous names entirely rather than guess

@@ -7,19 +7,27 @@ no more than about once a day.
 """
 
 import logging
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
 from src.players import RELEVANT_POSITIONS, sleeper_to_player
-from src.storage import data_path, file_age_seconds, is_fresh, read_json, write_json_atomic
+from src.state_manager import load_league
+from src.storage import DataUnavailable, data_path, file_age_seconds, is_fresh, read_json, write_json_atomic
 
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://api.sleeper.app/v1"
 TIMEOUT = 10
 PLAYERS_TTL = 12 * 3600
+GAMEDAY_PLAYERS_TTL = 4 * 3600  # injury news moves fast on game days (Thu/Sun/Mon, Sat in Dec–Jan)
+LAST_REGULAR_WEEK = 18
+_ET = ZoneInfo("America/New_York")
+_players_lock = threading.Lock()  # parallel league syncs share one download
 FAAB_WAIVER_TYPE = 2  # Sleeper settings.waiver_type: 0 rolling, 1 reverse standings, 2 FAAB
 
 
@@ -43,35 +51,76 @@ def _get(path: str, timeout: int = TIMEOUT):
 
 # ── Player database ───────────────────────────────────────────────────────────
 
+def players_ttl(now: datetime | None = None) -> int:
+    """How long the player database (and so injury statuses) may be cached right now."""
+    et = (now or datetime.now(timezone.utc)).astimezone(_ET)
+    game_day = et.weekday() in (0, 3, 6) or (et.weekday() == 5 and et.month in (12, 1))
+    return GAMEDAY_PLAYERS_TTL if game_day else PLAYERS_TTL
+
+
+def _read_players(path) -> dict | None:
+    data = read_json(path) if path.exists() else None
+    return data if isinstance(data, dict) and data else None
+
+
 def fetch_all_players(force: bool = False) -> dict:
-    """All Sleeper NFL players {player_id: info}, file-cached for PLAYERS_TTL."""
+    """
+    All Sleeper NFL players {player_id: info}, file-cached for players_ttl().
+    Falls back to a stale cache when the download fails; raises
+    DataUnavailable when there is no usable cached copy either.
+    """
     path = _players_cache()
-    if not force and is_fresh(path, PLAYERS_TTL):
-        return read_json(path)
+    requested_at = time.time()
+    ttl = players_ttl()
+    if not force and is_fresh(path, ttl) and (cached := _read_players(path)):
+        return cached
 
-    players, err = _get("/players/nfl", timeout=60)
-    if players:
-        write_json_atomic(players, path)
-        return players
+    with _players_lock:
+        # Another thread may have downloaded it while this one waited for the lock
+        just_written = path.exists() and path.stat().st_mtime >= requested_at
+        if (just_written or (not force and is_fresh(path, ttl))) and (cached := _read_players(path)):
+            return cached
 
-    log.warning("Player database fetch failed: %s", err)
-    return read_json(path) if path.exists() else {}
+        players, err = _get("/players/nfl", timeout=60)
+        if isinstance(players, dict) and players:
+            write_json_atomic(players, path)
+            return players
+
+        log.warning("Player database fetch failed: %s", err)
+        cached = _read_players(path)
+        if cached:
+            return cached
+        raise DataUnavailable(f"Couldn't load the Sleeper player database: {err or 'empty response'}")
 
 
 def players_db_age_seconds() -> float | None:
     return file_age_seconds(_players_cache())
 
 
+def players_db_due(now: datetime | None = None) -> bool:
+    """True when the cached player database is missing or older than players_ttl(now)."""
+    age = players_db_age_seconds()
+    return age is None or age >= players_ttl(now)
+
+
 # ── League lookups ────────────────────────────────────────────────────────────
 
-def get_nfl_state() -> dict:
-    """Current NFL season/week per Sleeper (/state/nfl), falling back to the calendar."""
-    state, _ = _get("/state/nfl")
+def _fetch_nfl_state():
+    """(state, None) from Sleeper's /state/nfl, or (None, error)."""
+    state, err = _get("/state/nfl")
     if state and state.get("season"):
         # "week" is the upcoming/in-progress week (the one waiver claims and lineups are for);
         # Sleeper's display_week lags behind it until mid-week.
         week = state.get("week") if state.get("season_type") == "regular" else None
-        return {"season": str(state["season"]), "week": week, "season_type": state.get("season_type")}
+        return {"season": str(state["season"]), "week": week, "season_type": state.get("season_type")}, None
+    return None, err or "Sleeper returned no NFL state."
+
+
+def get_nfl_state() -> dict:
+    """Current NFL season/week per Sleeper (/state/nfl), falling back to the calendar."""
+    state, _ = _fetch_nfl_state()
+    if state:
+        return state
     from src.wrangler import current_nfl_season
     return {"season": str(current_nfl_season()), "week": None, "season_type": None}
 
@@ -132,7 +181,7 @@ def assign_slots(starters: list, roster_positions: list, reserve: list, taxi: li
     for pid in reserve or []:
         slots[pid] = "IR"
     for pid in taxi or []:
-        slots[pid] = "Taxi"
+        slots[pid] = "TAXI"
     return slots
 
 
@@ -151,44 +200,60 @@ def _record(roster: dict) -> dict:
     }
 
 
-def _current_matchup(league_id: str, week, my_roster: dict, rosters: list, team_names: dict) -> dict | None:
+def _side(m: dict) -> dict:
+    return {
+        "points": round(m.get("points") or 0, 2),
+        "starters": [pid for pid in m.get("starters") or [] if pid and pid != "0"],
+        # points scored so far by every rostered player this week (live during games)
+        "players_points": {pid: round(pts or 0, 2) for pid, pts in (m.get("players_points") or {}).items()},
+    }
+
+
+def _current_matchup(league_id: str, week, my_roster: dict, rosters: list, team_names: dict):
+    """(matchup | None, error | None) for `week`."""
     if not week:
-        return None
+        return None, None
     matchups, err = _get(f"/league/{league_id}/matchups/{week}")
     if not matchups:
         if err:
             log.warning("Matchup unavailable: %s", err)
-        return None
+        return None, err
     mine = next((m for m in matchups if m.get("roster_id") == my_roster.get("roster_id")), None)
     if not mine or mine.get("matchup_id") is None:
-        return {"week": week, "bye": True}
+        return {"week": week, "bye": True}, None
     opp = next((m for m in matchups if m.get("matchup_id") == mine["matchup_id"]
                 and m.get("roster_id") != mine["roster_id"]), None)
     opp_roster = next((r for r in rosters if opp and r.get("roster_id") == opp["roster_id"]), {})
+    me, them = _side(mine), _side(opp or {})
     return {
         "week": week,
-        "points": round(mine.get("points") or 0, 2),
-        "starters": [pid for pid in mine.get("starters") or [] if pid and pid != "0"],
+        **me,
         "opponent": team_names.get(opp_roster.get("owner_id"), "Unknown") if opp else None,
         "opponent_roster_id": opp.get("roster_id") if opp else None,
-        "opponent_points": round(opp.get("points") or 0, 2) if opp else None,
-        "opponent_starters": [pid for pid in (opp or {}).get("starters") or [] if pid and pid != "0"],
+        "opponent_points": them["points"] if opp else None,
+        "opponent_starters": them["starters"],
+        "opponent_players_points": them["players_points"],
         "opponent_record": _record(opp_roster) if opp_roster else None,
-    }
+    }, None
 
 
-def _schedule(league_id: str, week, playoff_week_start) -> dict:
+def _schedule(league_id: str, week, playoff_week_start):
     """
-    {week: [[roster_id, roster_id], ...]} for the rest of the regular season.
-    Sleeper publishes every week's pairings in advance; weeks it can't return are left out.
+    ({week: [[roster_id, roster_id], ...]}, complete) for the rest of the regular
+    season. Sleeper publishes every week's pairings in advance; weeks without
+    pairings are left out. `complete` is False when any week's request failed.
     """
     if not week:
-        return {}
+        return {}, True
     weeks = list(range(int(week), int(playoff_week_start or 15)))
     with ThreadPoolExecutor(max_workers=8) as pool:
         responses = list(pool.map(lambda wk: _get(f"/league/{league_id}/matchups/{wk}"), weeks))
-    out = {}
-    for wk, (rows, _err) in zip(weeks, responses):
+    out, complete = {}, True
+    for wk, (rows, err) in zip(weeks, responses):
+        if err:
+            log.warning("Schedule for week %s unavailable: %s", wk, err)
+            complete = False
+            continue
         pairs: dict = {}
         for m in rows or []:
             if m.get("matchup_id") is not None:
@@ -196,7 +261,7 @@ def _schedule(league_id: str, week, playoff_week_start) -> dict:
         games = [ids for ids in pairs.values() if len(ids) == 2]
         if games:
             out[str(wk)] = games
-    return out
+    return out, complete
 
 
 def _league_rosters(rosters: list, league: dict, team_names: dict) -> list:
@@ -204,27 +269,30 @@ def _league_rosters(rosters: list, league: dict, team_names: dict) -> list:
     out = []
     for r in rosters:
         reserve = r.get("reserve") or []
+        taxi = r.get("taxi") or []
         out.append({
             "roster_id": r.get("roster_id"),
             "owner_id": r.get("owner_id"),
             "team_name": team_names.get(r.get("owner_id"), f"Team {r.get('roster_id')}"),
-            "players": list(dict.fromkeys((r.get("players") or []) + reserve + (r.get("taxi") or []))),
+            "players": list(dict.fromkeys((r.get("players") or []) + reserve + taxi)),
             "reserve": reserve,
+            "taxi": taxi,  # taxi-squad players: rostered but not eligible to start (slot "TAXI")
             "faab_remaining": parse_faab_budget(league, r),
             "record": _record(r),
         })
     return out
 
 
-def _transactions(league_id: str, through_week: int | None) -> list:
-    """Compact waiver / free-agent transactions for weeks 1..through_week."""
-    out = []
+def _transactions(league_id: str, through_week: int | None):
+    """(compact waiver / free-agent transactions for weeks 1..through_week, [weeks that failed])."""
+    out, failed = [], []
     weeks = range(1, (through_week or 0) + 1)
     with ThreadPoolExecutor(max_workers=8) as pool:  # one request per week, fetched in parallel
         responses = list(pool.map(lambda wk: _get(f"/league/{league_id}/transactions/{wk}"), weeks))
     for wk, (txs, err) in zip(weeks, responses):
         if err:
             log.warning("Transactions for week %s unavailable: %s", wk, err)
+            failed.append(wk)
             continue
         for t in txs or []:
             if t.get("type") not in ("waiver", "free_agent"):
@@ -240,12 +308,29 @@ def _transactions(league_id: str, through_week: int | None) -> list:
                 "note": (t.get("metadata") or {}).get("notes"),
                 "created": t.get("created"),
             })
-    return out
+    return out, failed
+
+
+def _transactions_through(week, league: dict, nfl_state: dict) -> int | None:
+    """
+    Last week to read transactions for: the current week in season; the whole
+    regular season once the league is complete or the NFL is in its
+    postseason (Sleeper's week is None then); None before the season.
+    """
+    if week:
+        return week
+    same_season = str(league.get("season", "")) == nfl_state["season"]
+    if league.get("status") == "complete" or (same_season and nfl_state.get("season_type") == "post"):
+        return LAST_REGULAR_WEEK
+    return None
 
 
 def _find_league(user_id: str, league_id_or_name: str):
     """Returns (league, error, nfl_state)."""
-    state = get_nfl_state()
+    state, err = _fetch_nfl_state()
+    if not state:
+        # Without the current week a sync would save a week-less league over good data
+        return None, f"Couldn't read the current NFL week from Sleeper: {err}", None
     season = state["season"]
     if league_id_or_name.isdigit() and len(league_id_or_name) > 10:
         league, err = _get(f"/league/{league_id_or_name}")
@@ -261,8 +346,24 @@ def _find_league(user_id: str, league_id_or_name: str):
     return None, f"Could not find a league named '{league_id_or_name}' in {season} or {int(season) - 1}.", state
 
 
-def sync_sleeper_league(username: str, league_id_or_name: str):
-    """Returns (league_data, None) on success or (None, error message)."""
+def _carry_forward(previous: dict, league_id: str, season: str) -> dict:
+    """The previously saved sync of this league and season, or {} (nothing to reuse)."""
+    if previous.get("league_id") == league_id and str(previous.get("season", "")) == season:
+        return previous
+    return {}
+
+
+def sync_sleeper_league(username: str, league_id_or_name: str, players_db: dict | None = None,
+                        previous: dict | None = None):
+    """
+    Returns (league_data, None) on success or (None, error message).
+
+    A failed /state/nfl, user, league, rosters or player-database request fails
+    the sync (so the last good file is kept). Failed secondary requests (users,
+    matchups, transactions, schedule weeks) don't: their values are carried
+    forward from `previous` (default: the saved file for this league) and named
+    in league_data["partial"], so the caller can retry sooner.
+    """
     if not username or not league_id_or_name:
         return None, "Please enter both username and league identifier."
 
@@ -287,9 +388,18 @@ def sync_sleeper_league(username: str, league_id_or_name: str):
     if not my_roster:
         return None, f"'{username}' doesn't own a roster in {league.get('name', league_id)}."
 
-    players_db = fetch_all_players()
+    if players_db is None:
+        try:
+            players_db = fetch_all_players()
+        except DataUnavailable as e:
+            log.warning("%s", e)
+            players_db = {}
     if not players_db:
         return None, "Couldn't load the Sleeper player database. Try again shortly."
+
+    league_season = str(league.get("season", ""))
+    prev = _carry_forward(load_league(league_id) if previous is None else previous, league_id, league_season)
+    partial = []
 
     roster_positions = league.get("roster_positions") or []
     reserve = my_roster.get("reserve") or []
@@ -303,13 +413,38 @@ def sync_sleeper_league(username: str, league_id_or_name: str):
         roster.append(p)
 
     users, err = _get(f"/league/{league_id}/users")
-    if users is None:
-        log.warning("League users unavailable: %s", err)
     team_names = _team_names(users)
+    if err:
+        log.warning("League users unavailable: %s", err)
+        partial.append("users")
+        team_names = {r["owner_id"]: r["team_name"] for r in prev.get("league_rosters") or []
+                      if r.get("owner_id") and r.get("team_name")}
     trend_map = {t["player_id"]: t.get("count", 0) for t in get_trending_players("add")}
     settings = league.get("settings") or {}
-    league_season = str(league.get("season", ""))
     week = nfl_state.get("week") if league_season == nfl_state["season"] else None
+
+    def matchup_for(wk, field):
+        result, m_err = _current_matchup(league_id, wk, my_roster, rosters, team_names)
+        if m_err:
+            partial.append(field)
+            old = prev.get(field)
+            return old if old and old.get("week") == wk else None
+        return result
+
+    matchup = matchup_for(week, "matchup")
+    last_result = matchup_for(week - 1, "last_result") if week and week > 1 else None
+
+    transactions, failed_weeks = _transactions(league_id, _transactions_through(week, league, nfl_state))
+    if failed_weeks:
+        partial.append("transactions")
+        transactions += [t for t in prev.get("transactions") or [] if t.get("week") in failed_weeks]
+        transactions.sort(key=lambda t: (t.get("week") or 0, t.get("created") or 0))
+
+    schedule, schedule_complete = _schedule(league_id, week, settings.get("playoff_week_start"))
+    if not schedule_complete:
+        partial.append("schedule")
+        kept = {wk: games for wk, games in (prev.get("schedule") or {}).items() if int(wk) >= int(week)}
+        schedule = {**kept, **schedule}
 
     data = {
         "league_id": league_id,
@@ -330,20 +465,24 @@ def sync_sleeper_league(username: str, league_id_or_name: str):
         "playoff_week_start": settings.get("playoff_week_start"),
         "record": _record(my_roster),
         "roster_id": my_roster.get("roster_id"),
-        "matchup": _current_matchup(league_id, week, my_roster, rosters, team_names),
-        "last_result": _current_matchup(league_id, week - 1, my_roster, rosters, team_names) if week and week > 1 else None,
+        "matchup": matchup,
+        "last_result": last_result,
         "league_rosters": _league_rosters(rosters, league, team_names),
-        "transactions": _transactions(league_id, week),
+        "transactions": transactions,
         "waiver_settings": {k: settings.get(k) for k in
                             ("waiver_type", "waiver_day_of_week", "waiver_clear_days", "waiver_bid_min", "daily_waivers")},
         "playoff_teams": settings.get("playoff_teams"),
+        "playoff_round_type": settings.get("playoff_round_type"),  # 0 = 1 wk/round, 1 = 2-wk final, 2 = 2 wks/round
         "median_game": bool(settings.get("league_average_match")),  # each week also scored vs the league median
         "trade_deadline": settings.get("trade_deadline"),
-        "schedule": _schedule(league_id, week, settings.get("playoff_week_start")),
+        "schedule": schedule,
+        "schedule_complete": schedule_complete,
         "roster": roster,
         "waivers": build_waiver_pool(rosters, players_db, trend_map),
         "scoring_settings": league.get("scoring_settings", {}),
         "roster_positions": roster_positions,
+        # parts whose request failed and were carried forward from the last sync (retry soon)
+        "partial": partial,
         "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     return data, None

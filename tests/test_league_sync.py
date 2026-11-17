@@ -15,7 +15,7 @@ def _iso(minutes_ago):
 def test_assign_slots_maps_starters_to_lineup_order():
     positions = ["QB", "RB", "RB", "FLEX", "DEF", "BN", "BN", "IR"]
     slots = assign_slots(["q", "r1", "0", "f", "d"], positions, reserve=["hurt"], taxi=["kid"])
-    assert slots == {"q": "QB", "r1": "RB", "f": "FLEX", "d": "DEF", "hurt": "IR", "kid": "Taxi"}
+    assert slots == {"q": "QB", "r1": "RB", "f": "FLEX", "d": "DEF", "hurt": "IR", "kid": "TAXI"}
 
 
 def test_sync_due_logic():

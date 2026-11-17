@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -32,14 +33,13 @@ def _game(t, home, away, total, home_spread):
     ]}]}
 
 
-def test_vegas_uses_each_teams_earliest_game():
+def test_vegas_uses_only_this_weeks_games():
     games = [
         _game("2026-10-25T17:00:00Z", "Buffalo Bills", "Miami Dolphins", 40.0, -2.0),   # later week
-        _game("2026-10-18T17:00:00Z", "Buffalo Bills", "New York Jets", 47.0, -7.0),    # next week
+        _game("2026-10-18T17:00:00Z", "Buffalo Bills", "New York Jets", 47.0, -7.0),    # this week
     ]
-    totals = parse_implied_totals(games)
-    assert totals["BUF"] == 27.0 and totals["NYJ"] == 20.0
-    assert totals["MIA"] == 19.0  # MIA's next game is still used even though BUF's was set earlier
+    totals = parse_implied_totals(games, datetime(2026, 10, 14, tzinfo=timezone.utc))
+    assert totals == {"BUF": 27.0, "NYJ": 20.0}  # MIA plays next week: no line rather than next week's
 
 
 def test_safe_key_blocks_path_traversal(leagues_dir):

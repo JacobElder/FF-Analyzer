@@ -1,7 +1,8 @@
 """
 Keep the configured default leagues in sync with Sleeper.
 
-A league is re-synced when its saved data is older than the configured age.
+A league is re-synced when its saved data is older than the configured age
+(or PARTIAL_RETRY_S when the last sync had to carry some parts forward).
 Failed attempts are remembered (in `attempts`) so an outage doesn't trigger a
 re-sync on every Streamlit rerun; the last good copy keeps being used.
 """
@@ -28,16 +29,28 @@ def sync_age_seconds(data: dict, now: float | None = None) -> float | None:
     return now - ts.timestamp()
 
 
+PARTIAL_RETRY_S = 5 * 60  # a sync that carried some parts forward is retried this soon
+
+
+def effective_max_age(data: dict, max_age_s: float) -> float:
+    """max_age_s, shortened to PARTIAL_RETRY_S when the saved sync is partial."""
+    return min(max_age_s, PARTIAL_RETRY_S) if data.get("partial") else max_age_s
+
+
 def is_sync_due(data: dict, max_age_s: float, now: float | None = None) -> bool:
     age = sync_age_seconds(data, now)
-    return age is None or age > max_age_s
+    return age is None or age > effective_max_age(data, max_age_s)
 
 
 def leagues_due(league_ids: list, max_age_s: float, attempts: dict, now: float | None = None) -> list:
-    """League IDs whose data is stale and that weren't attempted within max_age_s."""
+    """League IDs whose data is stale and that weren't attempted within their max age."""
     now = now if now is not None else time.time()
-    return [lid for lid in league_ids
-            if is_sync_due(load_league(lid), max_age_s, now) and now - attempts.get(lid, 0) >= max_age_s]
+    due = []
+    for lid in league_ids:
+        data = load_league(lid)
+        if is_sync_due(data, max_age_s, now) and now - attempts.get(lid, 0) >= effective_max_age(data, max_age_s):
+            due.append(lid)
+    return due
 
 
 def auto_sync(username: str, league_ids: list, max_age_s: float, attempts: dict,
@@ -60,7 +73,8 @@ def auto_sync(username: str, league_ids: list, max_age_s: float, attempts: dict,
         except Exception as e:  # one bad league must not stop the others
             return None, f"Sync failed: {e}"
 
-    # Leagues sync in parallel (each is a dozen Sleeper requests); results are saved in order
+    # Leagues sync in parallel (each is a dozen Sleeper requests); results are saved in order.
+    # They share one player-database download (fetch_all_players holds a lock while downloading).
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(attempt, due))
     for lid, (data, err) in zip(due, results):

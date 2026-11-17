@@ -4,7 +4,7 @@ Open-Meteo. Payloads are shaped like the real responses (trimmed).
 """
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 import requests
@@ -54,9 +54,10 @@ def test_players_db_falls_back_to_stale_cache(monkeypatch):
     assert si.fetch_all_players(force=True) == DB
 
 
-def test_players_db_empty_without_cache_or_network(monkeypatch):
+def test_players_db_raises_without_cache_or_network(monkeypatch):
     _route(monkeypatch, si, si.BASE_URL, {"/players/nfl": requests.ConnectionError("down")})
-    assert si.fetch_all_players() == {}
+    with pytest.raises(storage.DataUnavailable):
+        si.fetch_all_players()
 
 
 # ── Sleeper: NFL state ───────────────────────────────────────────────────────
@@ -129,12 +130,13 @@ def test_full_sync_builds_league_data(monkeypatch):
     assert data["budget"] == 85 and data["faab_enabled"] and data["week"] == 3
     assert data["record"] == {"wins": 2, "losses": 0, "ties": 0, "points_for": 250.5, "waiver_position": 2}
     slots = {p["player_id"]: p["slot"] for p in data["roster"]}
-    assert slots == {"qb1": "QB", "wr1": "WR", "rb1": "IR", "te1": "Taxi"}
+    assert slots == {"qb1": "QB", "wr1": "WR", "rb1": "IR", "te1": "TAXI"}
     assert data["matchup"]["opponent"] == "rival" and data["matchup"]["opponent_points"] == 8.0
     assert data["last_result"] == {"week": 2, "bye": True}
     assert [p["player_id"] for p in data["waivers"]] == ["fa1"]  # inactive / rostered excluded
     assert data["waivers"][0]["trend_count"] == 300
     assert [t["bid"] for t in data["transactions"]] == [12]  # trades skipped, failed week tolerated
+    assert "transactions" in data["partial"]
     assert data["waiver_settings"]["waiver_bid_min"] == 1
     assert data["synced_at"].endswith("+00:00")
 
@@ -182,7 +184,8 @@ def _book(total=None, spread=None, home="Buffalo Bills"):
 
 
 def test_vegas_uses_later_bookmaker_when_first_lacks_a_market():
-    totals = vegas.parse_implied_totals([_game("Buffalo Bills", "New York Jets", [_book(total=44), _book(spread=-7)])])
+    totals = vegas.parse_implied_totals([_game("Buffalo Bills", "New York Jets", [_book(total=44), _book(spread=-7)])],
+                                        datetime(2026, 10, 22, tzinfo=timezone.utc))
     assert totals == {"BUF": 25.5, "NYJ": 18.5}
 
 
@@ -194,10 +197,11 @@ def test_vegas_without_key_makes_no_request(monkeypatch):
 def test_vegas_fetch_caches_and_falls_back_to_stale(monkeypatch):
     monkeypatch.setenv("ODDS_API_KEY", "secret-key")
     games = [_game("Buffalo Bills", "New York Jets", [_book(total=44, spread=-7)])]
+    now = datetime(2026, 10, 22, tzinfo=timezone.utc).timestamp()
     _route(monkeypatch, vegas, vegas.BASE_URL, {"/sports/americanfootball_nfl/odds": games})
-    assert vegas.fetch_implied_totals()["BUF"] == 25.5
+    assert vegas.fetch_implied_totals(now=now)["BUF"] == 25.5
     _route(monkeypatch, vegas, vegas.BASE_URL, {"/sports/americanfootball_nfl/odds": FakeResponse(429)})
-    assert vegas.fetch_implied_totals(force=True)["BUF"] == 25.5  # rate-limited: keep last good data
+    assert vegas.fetch_implied_totals(force=True, now=now)["BUF"] == 25.5  # rate-limited: keep last good data
 
 
 def test_vegas_error_log_never_contains_api_key(monkeypatch, caplog):
@@ -273,5 +277,6 @@ def test_sync_stores_schedule_median_game_and_trade_deadline(monkeypatch):
     data, err = si.sync_sleeper_league("me", LID)
     assert err is None
     assert data["schedule"] == {"3": [[1, 2]], "4": [[1, 2]]}  # weeks 6–14 unavailable: skipped
+    assert data["schedule_complete"] is False and "schedule" in data["partial"]
     assert data["median_game"] is True and data["trade_deadline"] == 11
-    assert si._schedule(LID, None, 15) == {}
+    assert si._schedule(LID, None, 15) == ({}, True)

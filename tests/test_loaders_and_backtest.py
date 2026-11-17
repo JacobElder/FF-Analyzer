@@ -1,5 +1,7 @@
 """File-cached loaders (schedule, weekly stats, odds) and the backtest, with downloads stubbed."""
 
+from datetime import datetime, timezone
+
 import pandas as pd
 import pytest
 
@@ -50,14 +52,7 @@ def test_fetch_schedules_falls_back_to_stale_cache_or_empty(monkeypatch):
 
 def test_load_season_downloads_caches_and_skips_empty(monkeypatch):
     frames = {2026: pd.DataFrame({"player_id": ["a"], "week": [1]}), 2027: pd.DataFrame()}
-    real = pd.read_parquet
-
-    def read(src, *a, **k):
-        s = str(src)
-        if s.startswith("http"):
-            return frames[2026 if "2026" in s else 2027]
-        return real(src, *a, **k)
-    monkeypatch.setattr(wrangler.pd, "read_parquet", read)
+    monkeypatch.setattr(wrangler, "download_parquet", lambda url: frames[2026 if "2026" in url else 2027])
     assert len(wrangler._load_season(2026, force=False)) == 1
     assert data_path("weekly_stats_2026.parquet").exists()
     assert len(wrangler._load_season(2026, force=False)) == 1  # fresh cache
@@ -65,14 +60,15 @@ def test_load_season_downloads_caches_and_skips_empty(monkeypatch):
     assert not data_path("weekly_stats_2027.parquet").exists()  # empty downloads aren't cached
 
 
-def test_load_season_with_nothing_available(monkeypatch):
-    monkeypatch.setattr(wrangler.pd, "read_parquet", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
-    assert wrangler._load_season(2026, force=True).empty
+def test_load_season_with_nothing_available_raises(monkeypatch):
+    monkeypatch.setattr(wrangler, "download_parquet", lambda url: (_ for _ in ()).throw(OSError("offline")))
+    with pytest.raises(wrangler.DataUnavailable):
+        wrangler._load_season(2026, force=True)
 
 
 def test_vegas_fresh_cache_skips_request(monkeypatch):
     monkeypatch.setenv("ODDS_API_KEY", "k")
-    write_json_atomic({"BUF": 24.0}, data_path("vegas_totals.json"))
+    write_json_atomic({"BUF": 24.0}, data_path("vegas_totals.json"))  # legacy flat format, dated by mtime
     monkeypatch.setattr(vegas.requests, "get", lambda *a, **k: pytest.fail("cache should be used"))
     assert vegas.fetch_implied_totals() == {"BUF": 24.0}
 
@@ -85,8 +81,8 @@ def test_vegas_skips_unknown_teams_and_later_games():
     totals = vegas.parse_implied_totals([
         g("London Monarchs", "Buffalo Bills", "2026-10-01"),
         g("Buffalo Bills", "Miami Dolphins", "2026-10-02"),
-        g("Miami Dolphins", "Buffalo Bills", "2026-10-09", total=60),  # both already set: ignored
-    ])
+        g("Miami Dolphins", "Buffalo Bills", "2026-10-02T20:00", total=60),  # both already set: ignored
+    ], datetime(2026, 9, 30, tzinfo=timezone.utc))
     assert totals == {"BUF": 23.5, "MIA": 20.5}
 
 
@@ -148,7 +144,8 @@ def test_backtest_scores_history_and_blend_models(monkeypatch):
     maes = [mae for _, mae, _ in results["next_week"]]
     assert maes == sorted(maes)
     best_history = next(r for r in results["next_week"] if r[0][0] == "history")
-    assert best_history[1] == pytest.approx(0.0) and best_history[2] == 2 * 5  # flat lines: perfect history
+    assert best_history[1] == pytest.approx(0.0) and best_history[2] == 5  # flat lines: perfect history
+    # history is scored on the same rows as the blends: g1's 5 weeks (g2 has no projection)
 
 
 def test_backtest_main_prints_report(monkeypatch, capsys):
