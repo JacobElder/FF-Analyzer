@@ -24,9 +24,10 @@ import pandas as pd
 
 from src.defense import get_matchup_info
 from src.evaluator import DEFAULT_ROSTER_POSITIONS, _expected_pts, optimal_lineup
+from src.schedule import playoff_weeks
 
-# Backtested on 2025 (python -m src.backtest): 80% projection / 20% history had
-# the lowest error for both next-week and next-4-weeks points.
+# Backtested on 2025 (python -m src.backtest [season]). The latest run slightly favored
+# 0.9 over 0.8 (next-week MAE 3.714 vs 3.718): too small a gap to act on, so 0.8 stays.
 PROJECTION_WEIGHT = 0.8
 
 # Estimated games missed by designation (Sleeper gives no return dates).
@@ -71,11 +72,19 @@ def team_week_opponents(schedules_df: pd.DataFrame) -> dict:
     return out
 
 
-def fantasy_weeks(current_week: int | None, playoff_week_start: int | None, last_nfl_week: int = 18) -> list:
-    """Weeks still to be played through the end of the fantasy playoffs."""
+def fantasy_weeks(current_week: int | None, playoff_week_start: int | None, last_nfl_week: int = 18,
+                  settings: dict | None = None) -> list:
+    """
+    Weeks still to be played through the end of the fantasy playoffs. `settings`
+    (league settings with playoff_teams / playoff_round_type, see
+    schedule.playoff_rounds) sets the playoff length; without it, 3 one-week rounds.
+    """
     if not current_week:
         return []
-    last = min(last_nfl_week, (playoff_week_start or 15) + 2)
+    s = dict(settings or {})
+    if playoff_week_start:
+        s["playoff_week_start"] = playoff_week_start
+    last = min(last_nfl_week, max(playoff_weeks(s), default=last_nfl_week))
     return list(range(int(current_week), last + 1))
 
 
@@ -118,7 +127,9 @@ class ValuationContext:
         if pid:
             for w in self.weeks[1:]:
                 if not self.covers(w):
-                    break  # past Sleeper's projections: fall back to the estimate
+                    # Past Sleeper's projections: fall back to the estimate, but he was out through
+                    # every published week, so not before this one (as in week_values)
+                    return max(self.current_week + out, w)
                 if self.projections.get(pid, w) is not None:
                     return w
             else:
@@ -247,17 +258,20 @@ def roster_limit(roster_positions: list | None) -> int:
     return len([s for s in (roster_positions or DEFAULT_ROSTER_POSITIONS) if s not in NON_ROSTER_SLOTS])
 
 
-def handcuff_bonus(add: dict, roster: list, ctx: ValuationContext) -> tuple[float, str | None]:
+def handcuff_bonus(add: dict, roster: list, ctx: ValuationContext,
+                   weights: dict | None = None) -> tuple[float, str | None]:
     """
     Insurance value of a backup RB whose starter is on this roster:
-    STARTER_MISS_RATE × HANDCUFF_SHARE × starter's points, summed over weeks.
+    STARTER_MISS_RATE × HANDCUFF_SHARE × starter's points, summed over weeks
+    (each week scaled by `weights`, default 1).
     """
     if add.get("position") != "RB" or (ctx.depth_info(add)["order"] or 0) < 2:
         return 0.0, None
     for p in roster:
         if (p.get("position") == "RB" and p.get("team") == add.get("team") and p.get("slot") not in NON_LINEUP_SLOTS
                 and ctx.depth_info(p)["order"] == 1):
-            bonus = sum(STARTER_MISS_RATE * HANDCUFF_SHARE * v for v in ctx.week_values(p).values())
+            bonus = sum(STARTER_MISS_RATE * HANDCUFF_SHARE * v * (weights or {}).get(w, 1.0)
+                        for w, v in ctx.week_values(p).items())
             return round(bonus, 2), p["name"]
     return 0.0, None
 
@@ -269,9 +283,20 @@ def evaluate_add(add: dict, roster: list, ctx: ValuationContext, roster_position
     costs the least (no drop if there's an open roster spot).
 
     `weights` ({week: multiplier}, default 1) scales each week's gain in the total,
-    e.g. playoff weeks by the chance of being there; `weekly_gain` stays unweighted.
+    e.g. playoff weeks by the chance of being there.
 
-    Returns {"gain_total", "gain_per_week", "weekly_gain", "drop", "handcuff_for", "handcuff_bonus"}
+    DEF/K streamers: the add counts only in the next STREAM_HORIZON weeks (he'll be
+    streamed away after), but the dropped player's loss counts in every week, unless
+    he's a DEF/K too (then he's as replaceable from free agency as the add is).
+
+    Returns:
+      weekly_gain     {week: lineup points gained}, unweighted, WITHOUT the handcuff bonus
+      handcuff_bonus  weighted insurance value (see handcuff_bonus)
+      gain_total      Σ weekly_gain × weight + handcuff_bonus
+      gain_per_week   gain_total ÷ the summed weights of the weeks the add is held for
+                      (STREAM_HORIZON weeks for streamers, else every week): a
+                      weighted average weekly gain that INCLUDES the handcuff bonus
+      drop, drop_options, handcuff_for, streamer
     """
     positions = roster_positions or DEFAULT_ROSTER_POSITIONS
     base = base_totals or lineup_totals(roster, ctx, positions)
@@ -283,14 +308,21 @@ def evaluate_add(add: dict, roster: list, ctx: ValuationContext, roster_position
         # Cheapest drops: lowest rest-of-season value first
         drop_options = sorted(eligible, key=ctx.ros_total)[:max_drop_candidates]
 
-    horizon = set(ctx.weeks[:STREAM_HORIZON]) if add.get("position") in STREAM_POSITIONS else set(ctx.weeks)
-    bonus, cuff_for = handcuff_bonus(add, roster, ctx)
+    streamer = add.get("position") in STREAM_POSITIONS
+    horizon = set(ctx.weeks[:STREAM_HORIZON]) if streamer else set(ctx.weeks)
+    wt = weights or {}
+    bonus, cuff_for = handcuff_bonus(add, roster, ctx, weights)
     options = []
     for drop in drop_options:
-        new_roster = [p for p in roster if p is not drop] + [{**add, "slot": "BN"}]
-        totals = lineup_totals(new_roster, ctx, positions)
-        weekly = {w: round(totals[w] - base[w], 2) if w in horizon else 0.0 for w in ctx.weeks}
-        total = sum(g * (weights or {}).get(w, 1.0) for w, g in weekly.items())
+        without_drop = [p for p in roster if p is not drop]
+        totals = lineup_totals(without_drop + [{**add, "slot": "BN"}], ctx, positions)
+        # Lineup with the drop gone but the add not counted, for the weeks past a streamer's horizon
+        # (same as base when nothing, or another streamable DEF/K, is dropped)
+        lasting_drop = streamer and drop is not None and drop.get("position") not in STREAM_POSITIONS
+        dropped = lineup_totals(without_drop, ctx, positions) if lasting_drop else base
+        weekly = {w: round((totals[w] - dropped[w] if w in horizon else 0.0) + dropped[w] - base[w], 2)
+                  for w in ctx.weeks}
+        total = sum(g * wt.get(w, 1.0) for w, g in weekly.items())
         options.append({"drop": drop, "gain_total": round(total + bonus, 2), "weekly_gain": weekly})
     options.sort(key=lambda o: -o["gain_total"])
 
@@ -299,8 +331,9 @@ def evaluate_add(add: dict, roster: list, ctx: ValuationContext, roster_position
                             for o in options]
     best["handcuff_bonus"] = bonus
     best["handcuff_for"] = cuff_for
-    best["streamer"] = add.get("position") in STREAM_POSITIONS
-    best["gain_per_week"] = round(best["gain_total"] / max(len(ctx.weeks), 1), 2)
+    best["streamer"] = streamer
+    held = sum(wt.get(w, 1.0) for w in horizon)
+    best["gain_per_week"] = round(best["gain_total"] / (held if held > 0 else 1.0), 2)
     return best
 
 

@@ -6,6 +6,7 @@ Schedule via the nflverse games file.
 """
 
 import logging
+import math
 from datetime import date, datetime
 
 import pandas as pd
@@ -44,13 +45,65 @@ STADIUM_COORDS = {
 }
 
 PLAYOFF_WEEKS = (15, 16, 17)  # Sleeper's default fantasy playoffs; leagues override via playoff_week_start
+DEFAULT_PLAYOFF_START = 15
+DEFAULT_PLAYOFF_ROUNDS = 3     # 5–8 team brackets; also used when the bracket size is unknown
+LAST_NFL_WEEK = 18
 
 
-def playoff_weeks_for(playoff_week_start: int | None) -> tuple:
+def _playoff_teams(settings: dict | None) -> int:
+    return int((settings or {}).get("playoff_teams") or 0)
+
+
+def playoff_rounds(settings: dict | None = None) -> list:
+    """
+    [[weeks of round 1], [weeks of round 2], ...] for a league's fantasy playoffs.
+
+    `settings` is Sleeper's league settings (or the synced league dict), using
+    `playoff_week_start` (default 15), `playoff_teams` (rounds = ceil(log2(teams)),
+    default 3) and `playoff_round_type` (0 = one week per round, 1 = two-week
+    championship, 2 = two weeks per round; default 0). Weeks past the NFL regular
+    season (week 18) are dropped.
+    """
+    s = settings or {}
+    start = int(s.get("playoff_week_start") or DEFAULT_PLAYOFF_START)
+    teams = _playoff_teams(s)
+    n_rounds = math.ceil(math.log2(teams)) if teams >= 2 else DEFAULT_PLAYOFF_ROUNDS
+    round_type = s.get("playoff_round_type") or 0
+    if round_type == 2:
+        lengths = [2] * n_rounds
+    elif round_type == 1:
+        lengths = [1] * (n_rounds - 1) + [2]
+    else:
+        lengths = [1] * n_rounds
+    rounds, week = [], start
+    for n in lengths:
+        weeks = [w for w in range(week, week + n) if w <= LAST_NFL_WEEK]
+        if not weeks:
+            break
+        rounds.append(weeks)
+        week += n
+    return rounds
+
+
+def playoff_weeks(settings: dict | None = None) -> list:
+    """Every fantasy-playoff week, in order (see playoff_rounds)."""
+    return [w for r in playoff_rounds(settings) for w in r]
+
+
+def playoff_byes(settings: dict | None = None) -> int:
+    """First-round byes: the top seeds that skip round 1 when the bracket isn't a power of 2 (6 teams → 2)."""
+    teams = _playoff_teams(settings)
+    if teams < 2:
+        return 0
+    return 2 ** math.ceil(math.log2(teams)) - teams
+
+
+def playoff_weeks_for(playoff_week_start: int | None, settings: dict | None = None) -> tuple:
+    """Playoff weeks as a tuple; `playoff_week_start` overrides the one in `settings`."""
+    s = dict(settings or {})
     if playoff_week_start:
-        start = int(playoff_week_start)
-        return (start, start + 1, start + 2)
-    return PLAYOFF_WEEKS
+        s["playoff_week_start"] = playoff_week_start
+    return tuple(playoff_weeks(s))
 
 
 # ── Schedule data ─────────────────────────────────────────────────────────────

@@ -8,7 +8,9 @@ everything else:
   - this week's chance of beating the league median
   - week weights: how much a point in each remaining week is worth to a team.
     Regular-season weeks count fully; a playoff week counts by the chance the
-    team is still alive then (playoff odds, halved for each earlier round)
+    team is still alive and playing then (playoff odds, halved for each earlier
+    round; a first-round bye seed doesn't play round 1). The bracket's weeks come
+    from schedule.playoff_rounds
   - a trade finder: 1-for-1 swaps that raise both teams' weighted lineup totals
 
 Team scores are normal around the best lineup's projection, with each starter's
@@ -21,9 +23,10 @@ import numpy as np
 
 from src.evaluator import optimal_lineup
 from src.players import sleeper_to_player
+from src.schedule import DEFAULT_PLAYOFF_START, playoff_byes, playoff_rounds
+from src.simulator import SCORE_CV  # noqa: F401  (re-exported: weekly scores vary by ~60% of their mean)
 from src.valuation import NON_ROSTER_SLOTS, lineup_totals
 
-SCORE_CV = 0.6                # weekly fantasy scores vary by about 60% of their mean
 PLAYOFF_ROUND_SURVIVAL = 0.5  # chance of winning each playoff round, for weighting later rounds
 N_SIMS = 4000
 
@@ -33,9 +36,11 @@ def _rng(seed: str):
 
 
 def team_roster(r: dict, players_db: dict) -> list:
-    """A league_rosters entry as roster dicts (reserve players in the IR slot)."""
+    """A league_rosters entry as roster dicts (reserve players in the IR slot, taxi squad in TAXI)."""
     reserve = set(r.get("reserve") or [])
-    return [{**sleeper_to_player(pid, players_db.get(pid, {})), "slot": "IR" if pid in reserve else "BN"}
+    taxi = set(r.get("taxi") or [])
+    return [{**sleeper_to_player(pid, players_db.get(pid, {})),
+             "slot": "IR" if pid in reserve else "TAXI" if pid in taxi else "BN"}
             for pid in r.get("players") or []]
 
 
@@ -73,6 +78,11 @@ def _wins(record: dict) -> float:
     return (record or {}).get("wins", 0) + 0.5 * (record or {}).get("ties", 0)
 
 
+def _games(record: dict) -> int:
+    r = record or {}
+    return (r.get("wins") or 0) + (r.get("losses") or 0) + (r.get("ties") or 0)
+
+
 def league_dists(league: dict, ctx, players_db: dict, positions: list) -> dict:
     """{roster_id: {week: (mean, variance)}} of every team's best lineup."""
     return {r["roster_id"]: lineup_dists(team_roster(r, players_db), ctx, positions)
@@ -82,20 +92,29 @@ def league_dists(league: dict, ctx, players_db: dict, positions: list) -> dict:
 def simulate_season(league: dict, ctx, players_db: dict, positions: list, n_sims: int = N_SIMS,
                     dists: dict | None = None) -> dict | None:
     """
-    Playoff odds for every team: {"p_playoffs": {roster_id: p}, "exp_wins": {roster_id: wins},
-    "weeks": [simulated weeks]}. `dists` (from league_dists) is computed when not given.
-    None when the league has no synced schedule or playoff size.
+    Playoff odds for every team: {"p_playoffs": {roster_id: p}, "p_bye": {roster_id: p},
+    "exp_wins": {roster_id: wins}, "weeks": [simulated weeks]}. `p_bye` is the chance
+    of a first-round bye seed (all 0 when the bracket has none, see schedule.playoff_byes).
+    `dists` (from league_dists) is computed when not given. None when the league has
+    no synced schedule or playoff size.
+
+    Sleeper can post this week's results to the records before it advances the
+    current week; when every week through the current one is already in the
+    records, the current week isn't simulated again.
     """
     rosters = league.get("league_rosters") or []
     schedule = league.get("schedule") or {}
     n_playoff = league.get("playoff_teams")
     if len(rosters) < 2 or not n_playoff or not schedule:
         return None
-    playoff_start = league.get("playoff_week_start") or 15
+    playoff_start = league.get("playoff_week_start") or DEFAULT_PLAYOFF_START
     ids = [r["roster_id"] for r in rosters]
     idx = {rid: i for i, rid in enumerate(ids)}
     dists = dists or league_dists(league, ctx, players_db, positions)
     weeks = [w for w in ctx.weeks if w < playoff_start and str(w) in schedule]
+    games_per_week = 2 if league.get("median_game") else 1
+    if ctx.current_week and max(_games(r.get("record")) for r in rosters) >= ctx.current_week * games_per_week:
+        weeks = [w for w in weeks if w != ctx.current_week]  # already final in the records
 
     rng = _rng(f"season|{league.get('league_id')}")
     wins = np.tile([_wins(r.get("record")) for r in rosters], (n_sims, 1)).astype(float)
@@ -115,26 +134,62 @@ def simulate_season(league: dict, ctx, players_db: dict, positions: list, n_sims
     order = np.argsort(-(wins * 1e6 + pf), axis=1)
     made = np.zeros_like(wins, dtype=bool)
     made[np.arange(n_sims)[:, None], order[:, :min(n_playoff, len(ids))]] = True
+    bye = np.zeros_like(wins, dtype=bool)
+    bye[np.arange(n_sims)[:, None], order[:, :min(playoff_byes(league), n_playoff, len(ids))]] = True
     return {
         "p_playoffs": {rid: round(float(made[:, idx[rid]].mean()), 3) for rid in ids},
+        "p_bye": {rid: round(float(bye[:, idx[rid]].mean()), 3) for rid in ids},
         "exp_wins": {rid: round(float(wins[:, idx[rid]].mean()), 1) for rid in ids},
         "weeks": weeks,
     }
 
 
-def week_weights(weeks: list, playoff_week_start: int | None, p_playoffs: float | None) -> dict:
-    """{week: weight}: 1 in the regular season; playoff weeks by the chance of still being alive."""
+def round_alive(p_playoffs: float, n_rounds: int, byes: int = 0, playoff_teams: int = 0,
+                p_bye: float | None = None) -> list:
+    """
+    Chance of playing in each playoff round. Without byes: p_playoffs, then halved
+    each round. With byes, round 1 is played only by seeds without one
+    (p_playoffs − p_bye), and the bye seeds rejoin in round 2. An unknown `p_bye`
+    is approximated as p_playoffs × byes / playoff_teams.
+    """
+    if not byes:
+        return [p_playoffs * PLAYOFF_ROUND_SURVIVAL ** k for k in range(n_rounds)]
+    if p_bye is None:
+        p_bye = p_playoffs * byes / playoff_teams
+    p_bye = min(max(p_bye, 0.0), p_playoffs)
+    second = p_bye + (p_playoffs - p_bye) * PLAYOFF_ROUND_SURVIVAL
+    return [p_playoffs - p_bye] + [second * PLAYOFF_ROUND_SURVIVAL ** k for k in range(n_rounds - 1)]
+
+
+def week_weights(weeks: list, playoff_week_start: int | None, p_playoffs: float | None,
+                 settings: dict | None = None, p_bye: float | None = None) -> dict:
+    """
+    {week: weight}: 1 in the regular season; each playoff week by the chance of
+    playing in that round (round_alive); 0 after the championship. `settings`
+    (league settings / synced league dict: playoff_teams, playoff_round_type) sets
+    the bracket; `playoff_week_start` overrides its start. Without settings: three
+    one-week rounds, no byes.
+    """
     if p_playoffs is None:
         return {w: 1.0 for w in weeks}
-    start = playoff_week_start or 15
-    return {w: 1.0 if w < start else round(p_playoffs * PLAYOFF_ROUND_SURVIVAL ** (w - start), 4) for w in weeks}
+    s = dict(settings or {})
+    if playoff_week_start:
+        s["playoff_week_start"] = playoff_week_start
+    start = int(s.get("playoff_week_start") or DEFAULT_PLAYOFF_START)
+    rounds = playoff_rounds(s)
+    alive = round_alive(p_playoffs, len(rounds), playoff_byes(s), int(s.get("playoff_teams") or 0), p_bye)
+    by_week = {w: a for r, a in zip(rounds, alive) for w in r}
+    return {w: 1.0 if w < start else round(by_week.get(w, 0.0), 4) for w in weeks}
 
 
-def all_week_weights(sim: dict | None, weeks: list, playoff_week_start: int | None) -> dict:
+def all_week_weights(sim: dict | None, weeks: list, playoff_week_start: int | None,
+                     settings: dict | None = None) -> dict:
     """{roster_id: week weights} for every team in the simulation ({} without one)."""
     if not sim:
         return {}
-    return {rid: week_weights(weeks, playoff_week_start, p) for rid, p in sim["p_playoffs"].items()}
+    p_bye = sim.get("p_bye") or {}
+    return {rid: week_weights(weeks, playoff_week_start, p, settings, p_bye.get(rid))
+            for rid, p in sim["p_playoffs"].items()}
 
 
 def weeks_until_deadline(trade_deadline, current_week) -> int | None:
@@ -166,10 +221,11 @@ def find_trades(my_roster: list, rivals: list, ctx, players_db: dict, positions:
     out = []
     for r in rivals:
         theirs_full = team_roster(r, players_db)
+        theirs = tradeable(theirs_full)
         their_base = lineup_totals(theirs_full, ctx, positions)
         their_weights = (rival_weights or {}).get(r["roster_id"])
         for give in mine:
-            for get in tradeable(theirs_full):
+            for get in theirs:
                 g_me = gain([p for p in my_roster if p is not give] + [{**get, "slot": "BN"}], my_base, my_weights)
                 if g_me < min_gain:
                     continue

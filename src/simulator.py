@@ -3,7 +3,9 @@ Monte Carlo simulation for fantasy football decisions.
 
 Each player's weekly score is a zero-inflated Gamma: a "dud" probability equal
 to their share of ≤0-point games, otherwise Gamma fitted to positive scores.
-Falls back to Normal when data is sparse.
+With fewer than 4 scored games (or a failed fit) it falls back to a Gamma with
+coefficient of variation SCORE_CV around the expected points. A `center` (this
+week's projection) recenters either distribution on that mean.
 
 Samples are seeded per player (name + scoring history), so the same player
 always gets the same samples. Every chart and probability for that player is
@@ -17,6 +19,7 @@ import numpy as np
 from scipy import stats as sp_stats
 
 N_SAMPLES = 10_000
+SCORE_CV = 0.6  # weekly fantasy scores vary by about 60% of their mean
 
 
 # ── Distribution fitting ──────────────────────────────────────────────────────
@@ -25,7 +28,16 @@ def _seed(key: str, weekly: list) -> int:
     return zlib.crc32(f"{key}|{weekly}".encode())
 
 
-def _fit_samples(weekly_pts: list, fallback_mean: float, rng: np.random.Generator) -> np.ndarray:
+def _gamma_around(mean: float, rng: np.random.Generator) -> np.ndarray:
+    """Gamma samples with this mean and CV = SCORE_CV; all 0 for a mean ≤ 0."""
+    if mean <= 0:
+        return np.zeros(N_SAMPLES)
+    shape = 1 / SCORE_CV ** 2
+    return rng.gamma(shape, mean / shape, N_SAMPLES)
+
+
+def _fit_samples(weekly_pts: list, fallback_mean: float, rng: np.random.Generator,
+                 center: float | None = None) -> np.ndarray:
     pts = np.asarray(weekly_pts, dtype=float)
     pts = pts[np.isfinite(pts)]
     positive = pts[pts > 0]
@@ -38,16 +50,22 @@ def _fit_samples(weekly_pts: list, fallback_mean: float, rng: np.random.Generato
                 p_dud = float(np.mean(pts <= 0))
                 if p_dud > 0:
                     samples[rng.random(N_SAMPLES) < p_dud] = 0.0
-                return samples
+                if center is None:
+                    return samples
+                # His own shape, this week's mean (≥4 positive games, so the mean is positive)
+                return samples * (max(float(center), 0.0) / max(float(np.mean(samples)), 1e-9))
         except Exception:
             pass
 
-    # Fallback: Normal from available data, or from the expected value.
+    # Fallback: Gamma around the projection, the average of the games he has, or the expected value.
     # No data at all means 0 — the same value the evaluator gives an unknown player.
-    mean = float(np.mean(pts)) if len(pts) >= 2 else float(fallback_mean or 0.0)
-    std = float(np.std(pts)) if len(pts) >= 2 else mean * 0.5
-    std = max(std, 1.0)  # prevent degenerate distribution
-    return np.clip(rng.normal(mean, std, N_SAMPLES), 0, None)
+    if center is not None:
+        mean = float(center)
+    elif len(pts) >= 2:
+        mean = float(np.mean(pts))
+    else:
+        mean = float(fallback_mean or 0.0)
+    return _gamma_around(mean, rng)
 
 
 def _summary(samples: np.ndarray) -> dict:
@@ -62,16 +80,18 @@ def _summary(samples: np.ndarray) -> dict:
     }
 
 
-def simulate_player(stats: dict, key: str = "", multiplier: float = 1.0) -> np.ndarray:
+def simulate_player(stats: dict, key: str = "", multiplier: float = 1.0,
+                    center: float | None = None) -> np.ndarray:
     """
-    N_SAMPLES simulated weekly outcomes. `multiplier` scales for this week's
-    matchup / injury (0 for an inactive player).
+    N_SAMPLES simulated weekly outcomes. `center` (e.g. this week's projection; 0
+    for a player on bye or out) sets the mean, keeping the shape of his history.
+    `multiplier` then scales for this week's matchup / injury (0 for an inactive player).
     """
     weekly = stats.get("weekly") or []
     recent = (stats.get("recent") or {}).get("ppg")
     fallback = recent if recent is not None else ((stats.get("season") or {}).get("ppg") or 0.0)
     rng = np.random.default_rng(_seed(key, weekly))
-    return _fit_samples(weekly, fallback, rng) * multiplier
+    return _fit_samples(weekly, fallback, rng, center) * multiplier
 
 
 def _p_greater(a: np.ndarray, b: np.ndarray) -> float:
@@ -127,17 +147,23 @@ def _verdict(p_better: float) -> str:
     return "NEGOTIATE"
 
 
-def simulate_lineup_change(before_names: list, after_names: list, stats_by_name: dict) -> dict:
+def _sample(name: str, stats: dict, centers: dict | None) -> np.ndarray:
+    return simulate_player(stats, name, center=(centers or {}).get(name))
+
+
+def simulate_lineup_change(before_names: list, after_names: list, stats_by_name: dict,
+                           centers: dict | None = None) -> dict:
     """
     Weekly starting-lineup totals before vs. after a trade. Players on both
     lineups share the same samples, so only the changed starters drive the
-    difference.
+    difference. `centers` ({name: this week's projection}, 0 = bye/out) centers
+    each listed player's distribution on it, as start/sit does; others use history.
     """
     cache = {}
 
     def samples(name):
         if name not in cache:
-            cache[name] = simulate_player(stats_by_name.get(name, {}), name)
+            cache[name] = _sample(name, stats_by_name.get(name, {}), centers)
         return cache[name]
 
     before = sum((samples(n) for n in before_names if n), np.zeros(N_SAMPLES))
@@ -151,13 +177,13 @@ def simulate_lineup_change(before_names: list, after_names: list, stats_by_name:
     }
 
 
-def simulate_trade(giving_stats: dict, receiving_stats: dict) -> dict:
+def simulate_trade(giving_stats: dict, receiving_stats: dict, centers: dict | None = None) -> dict:
     """
     Total weekly output of each side (used when no roster is loaded).
-    Either side may be empty.
+    Either side may be empty. `centers` as in simulate_lineup_change.
     """
-    give = sum((simulate_player(s, n) for n, s in giving_stats.items()), np.zeros(N_SAMPLES))
-    recv = sum((simulate_player(s, n) for n, s in receiving_stats.items()), np.zeros(N_SAMPLES))
+    give = sum((_sample(n, s, centers) for n, s in giving_stats.items()), np.zeros(N_SAMPLES))
+    recv = sum((_sample(n, s, centers) for n, s in receiving_stats.items()), np.zeros(N_SAMPLES))
     p_better = _p_greater(recv, give)
     return {
         "verdict":          _verdict(p_better),
