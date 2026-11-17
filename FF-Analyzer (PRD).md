@@ -1,3 +1,9 @@
+> **Historical design document — superseded by [README.md](README.md).** This PRD captures the
+> original plan and is no longer accurate: the app is not Gemini-agentic (Claude or Gemini only write
+> optional narrative on top of the app's own models), there is no `roster.json` (rosters sync from
+> Sleeper), there is no rpy2/nflfastR dependency (stats load via Python), and there is no
+> natural-language or screenshot roster editing. See README.md for current behavior.
+
 ### Product Requirements Document (PRD)
 
 **Project Name:** Fantasy-AI-Manager

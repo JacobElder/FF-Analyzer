@@ -1,15 +1,30 @@
 """Small display helpers used by the Streamlit UI (kept here so they're testable)."""
 
 
-def fmt_age(seconds: float) -> str:
-    """'5 min ago', '3h ago', '2 days ago'. Rounds before choosing the unit (no '60 min ago')."""
+def _plural(n: int, unit: str) -> str:
+    return f"{n} {unit}{'' if n == 1 else 's'} ago"
+
+
+def fmt_age(seconds: float | None) -> str:
+    """'just now', '1 minute ago', '5 minutes ago', '1 hour ago', '2 days ago'.
+
+    Under 30 seconds (or a missing/negative age) reads 'just now'. Rounds before choosing
+    the unit, so there is never a '60 minutes ago' or '24 hours ago'.
+    """
+    if seconds is None or seconds < 30:
+        return "just now"
     minutes = max(1, round(seconds / 60))
     if minutes < 60:
-        return f"{minutes} min ago"
+        return _plural(minutes, "minute")
     hours = round(seconds / 3600)
     if hours < 24:
-        return f"{hours}h ago"
-    return f"{round(seconds / 86400)} days ago"
+        return _plural(hours, "hour")
+    return _plural(round(seconds / 86400), "day")
+
+
+def fmt_as_of(label: str, seconds: float | None) -> str:
+    """'Injuries as of 3 hours ago' — a freshness caption built on fmt_age."""
+    return f"{label} as of {fmt_age(seconds)}"
 
 
 def lineup_summary(positions: list) -> str:

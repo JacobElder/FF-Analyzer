@@ -9,6 +9,7 @@ Model IDs are configurable via CLAUDE_MODEL / GEMINI_MODEL in .env.
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 
@@ -19,7 +20,25 @@ load_dotenv()
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+MAX_OUTPUT_TOKENS = 1024  # shared output cap for both providers
+MAX_ERROR_CHARS = 300     # provider error text shown to the user is truncated to this
+
 _KEY_ENV = {"claude": "ANTHROPIC_API_KEY", "gemini": "GOOGLE_API_KEY"}
+PROVIDER_LABELS = {"claude": "Claude", "gemini": "Gemini"}
+
+# Anything shaped like an Anthropic (sk-ant-...) or Google (AIza...) key is redacted from errors.
+_KEY_PATTERN = re.compile(r"sk-ant-[A-Za-z0-9_\-]+|AIza[A-Za-z0-9_\-]+")
+
+
+def available_providers() -> list[str]:
+    """Provider IDs (in PROVIDER_LABELS order) whose API key is set in the environment."""
+    return [p for p in PROVIDER_LABELS if os.getenv(_KEY_ENV[p])]
+
+
+def _safe_error(e: Exception) -> str:
+    """str(e) with key-like substrings redacted, truncated to MAX_ERROR_CHARS."""
+    text = _KEY_PATTERN.sub("[redacted]", str(e))
+    return text if len(text) <= MAX_ERROR_CHARS else text[:MAX_ERROR_CHARS].rstrip() + "…"
 
 SYSTEM_PROMPT = (
     "You are a concise fantasy football analyst. Base your analysis ONLY on the data in the "
@@ -57,14 +76,14 @@ class FantasyAgent:
             return f"⚠️ **Unknown AI provider:** {self.provider!r}. Use 'claude' or 'gemini'."
         api_key = os.getenv(key_name)
         if not api_key:
-            return f"⚠️ **API key not configured.** Add `{key_name}` to your `.env` file."
+            return f"⚠️ **API key not configured.** Add `{key_name}` to your `.env` file or Streamlit Secrets."
         try:
             if self.provider == "claude":
                 import anthropic
                 client = anthropic.Anthropic(api_key=api_key)
                 msg = client.messages.create(
                     model=CLAUDE_MODEL,
-                    max_tokens=1024,
+                    max_tokens=MAX_OUTPUT_TOKENS,
                     system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt}],
                 )
@@ -75,13 +94,14 @@ class FantasyAgent:
             resp = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
-                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT, max_output_tokens=MAX_OUTPUT_TOKENS),
             )
             return resp.text or "⚠️ The model returned an empty response."
         except ImportError as e:
             return f"⚠️ **AI package not installed:** {e}. Run `pip install -r requirements.txt`."
         except Exception as e:
-            return f"⚠️ **AI analysis failed:** {e}"
+            return f"⚠️ **AI analysis failed:** {_safe_error(e)}"
 
     def analyze_waiver(self, player_name, stats, roster, scoring=None, budget=100, context=None) -> str:
         scoring = scoring or DEFAULT_SCORING
@@ -99,9 +119,25 @@ Give a concise analysis (3-5 sentences): is this a worthwhile pickup, and why or
 End with: RECOMMENDATION: [ADD / STREAM / AVOID]"""
         return self.analyze(prompt)
 
-    def analyze_start_sit(self, p1_name, p2_name, p1_stats, p2_stats, scoring=None, contexts=None) -> str:
+    def analyze_start_sit(self, p1_name, p2_name, p1_stats, p2_stats, scoring=None, contexts=None,
+                          model_summary=None) -> str:
+        """model_summary: optional dict of the app's own verdict, e.g. {"Projection (this week)":
+        "P1 14.2 vs P2 11.8", "Floor / ceiling": ..., "P(P1 outscores P2)": "63%",
+        "Style": "Balanced", "App's pick": "P1"}. When given, the model explains that pick."""
         scoring = scoring or DEFAULT_SCORING
         contexts = contexts or {}
+        if model_summary:
+            verdict = f"""
+My model's assessment (this week's projections, not season averages):
+{_fmt_context(model_summary)}
+"""
+            task = ("Explain the app's pick above in a concise comparison (3-4 sentences) covering this "
+                    "week's projection, floor/ceiling, recent form, matchup, and injury status. Do not "
+                    "substitute a different pick based on season PPG alone. If the data above gives you a "
+                    "concrete reason to disagree with the app's pick, say so explicitly and explain why.")
+        else:
+            verdict = ""
+            task = "Give a concise comparison (3-4 sentences) covering recent form, matchup, and injury status."
         prompt = f"""Help me decide who to start this week in a {scoring_label(scoring)} league.
 
 Player 1: {p1_name}
@@ -111,8 +147,8 @@ Player 1: {p1_name}
 Player 2: {p2_name}
 {_fmt_stats(p2_stats, 4)}
 {_fmt_context(contexts.get(p2_name))}
-
-Give a concise comparison (3-4 sentences) covering recent form, matchup, and injury status.
+{verdict}
+{task}
 End with: START: [Player Name]"""
         return self.analyze(prompt)
 

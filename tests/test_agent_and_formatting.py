@@ -93,8 +93,9 @@ def test_prompts_include_key_facts_and_closing_line():
     assert "(nothing)" in a.prompt and "Star" in a.prompt and "VERDICT:" in a.prompt
 
 
-@pytest.mark.parametrize("seconds,text", [(10, "1 min ago"), (300, "5 min ago"), (3599, "1h ago"),
-                                          (7200, "2h ago"), (86000, "1 days ago"), (3 * 86400, "3 days ago")])
+@pytest.mark.parametrize("seconds,text", [(0, "just now"), (10, "just now"), (31, "1 minute ago"),
+                                          (300, "5 minutes ago"), (3599, "1 hour ago"),
+                                          (7200, "2 hours ago"), (86000, "1 day ago"), (3 * 86400, "3 days ago")])
 def test_fmt_age(seconds, text):
     assert fmt_age(seconds) == text
 

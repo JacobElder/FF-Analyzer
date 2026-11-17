@@ -1,3 +1,10 @@
+# Metadata only: there is no [build-system] and no package discovery, so this is not meant to be
+# pip-installed. Deployment (Streamlit Cloud) installs requirements.txt directly.
+[project]
+name = "ff-analyzer"
+version = "0.1.0"
+requires-python = ">=3.11"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers -q"
