@@ -16,6 +16,7 @@ pytest.importorskip("streamlit.testing.v1")
 import streamlit as st  # noqa: E402
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
+import src.agent  # noqa: E402
 import src.config  # noqa: E402
 import src.projections  # noqa: E402
 import src.schedule  # noqa: E402
@@ -168,8 +169,17 @@ def offline_app(monkeypatch):
     st.cache_resource.clear()
 
 
+def _fake_ai(monkeypatch, provider_env="GOOGLE_API_KEY"):
+    """Configure one AI provider and answer every request offline; returns the list of prompts sent."""
+    prompts = []
+    monkeypatch.setenv(provider_env, "test-key")
+    monkeypatch.setattr(src.agent.FantasyAgent, "analyze",
+                        lambda self, prompt: prompts.append(prompt) or f"AI says hi ({self.provider})")
+    return prompts
+
+
 def _run(at=None):
-    at = at or AppTest.from_file(APP, default_timeout=60)
+    at = at or AppTest.from_file(APP, default_timeout=180)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     return at
@@ -229,7 +239,7 @@ def test_current_week_projections_stay_live_after_thursday_stats(monkeypatch, le
 def test_start_sit_compare(leagues_dir):
     sm.save_league(_league())
     at = _run()
-    _widget(at.multiselect, "Select 2–4 players to compare").select("Ja'Marr Chase").select("Bench Guy")
+    _widget(at.multiselect, "Select 2–4 players to compare").select("wr1").select("wr2")
     _run(at)
     _widget(at.button, "⚖️ Compare").click()
     _run(at)
@@ -243,7 +253,7 @@ def test_start_sit_compare(leagues_dir):
 def test_trade_analysis_with_and_without_roster_context(leagues_dir):
     sm.save_league(_league())
     at = _run()
-    _widget(at.multiselect, "You Give (from your roster)").select("Bench Guy")
+    _widget(at.multiselect, "You Give (from your roster)").select("wr2")
     _widget(at.multiselect, "You Receive").select("opp1")
     _run(at)
     _widget(at.button, "🤝 Analyze Trade").click()
@@ -262,16 +272,30 @@ def test_waiver_browsing_and_deep_dive(leagues_dir):
         _run(at)
     pick = _widget(at.selectbox, "Select player")
     for i in range(len(pick.options)):
-        _widget(at.selectbox, "Select player").set_value(i)
+        _widget(at.selectbox, "Select player").select_index(i)
+        _run(at)
+        _widget(at.toggle, "🎲 Monte Carlo simulation").set_value(True)
         _run(at)
     assert "Player Deep Dive" in "\n".join(s.value for s in at.subheader)
 
 
-def test_ai_buttons_without_keys_show_setup_warning(leagues_dir):
+def test_ai_buttons_without_keys_show_setup_hint(leagues_dir):
     sm.save_league(_league())
     at = _run()
-    _widget(at.multiselect, "Select 2–4 players to compare").select("Ja'Marr Chase").select("Bench Guy")
-    _widget(at.multiselect, "You Give (from your roster)").select("Bench Guy")
+    _widget(at.multiselect, "Select 2–4 players to compare").select("wr1").select("wr2")
+    _run(at)
+    _widget(at.button, "⚖️ Compare").click()
+    _run(at)
+    assert not [b for b in at.button if "AI" in b.label] and not [r for r in at.sidebar.radio]
+    assert "Streamlit Secrets to use this" in _text(at)
+
+
+def test_ai_buttons_with_a_key(monkeypatch, leagues_dir):
+    prompts = _fake_ai(monkeypatch)
+    sm.save_league(_league())
+    at = _run()
+    _widget(at.multiselect, "Select 2–4 players to compare").select("wr1").select("wr2")
+    _widget(at.multiselect, "You Give (from your roster)").select("wr2")
     _run(at)
     _widget(at.button, "⚖️ Compare").click()
     _run(at)
@@ -279,18 +303,20 @@ def test_ai_buttons_without_keys_show_setup_warning(leagues_dir):
     _run(at)
     ai_buttons = [b for b in at.button if "AI" in b.label]
     assert ai_buttons
-    for label in [b.label for b in ai_buttons]:
-        _widget(at.button, label).click()
+    for key in [b.key for b in ai_buttons]:
+        at.button(key=key).click()
         _run(at)
-    assert "API key not configured" in _text(at)
-
+    assert "AI says hi (gemini)" in _text(at)
+    assert len(prompts) == len(ai_buttons)
+    assert "My model's assessment" in next(p for p in prompts if "who to start" in p)
 
 
 def test_ai_password_locks_ai_buttons_until_entered(monkeypatch, leagues_dir):
+    _fake_ai(monkeypatch)
     monkeypatch.setenv("AI_PASSWORD", "letmein")
     sm.save_league(_league())
     at = _run()
-    _widget(at.multiselect, "Select 2–4 players to compare").select("Ja'Marr Chase").select("Bench Guy")
+    _widget(at.multiselect, "Select 2–4 players to compare").select("wr1").select("wr2")
     _run(at)
     _widget(at.button, "⚖️ Compare").click()
     _run(at)
@@ -310,7 +336,7 @@ def test_ai_password_locks_ai_buttons_until_entered(monkeypatch, leagues_dir):
     assert ai_buttons
     _widget(at.button, ai_buttons[0].label).click()
     _run(at)
-    assert "API key not configured" in _text(at)
+    assert "AI says hi" in _text(at)
 
 def test_budget_change_and_zero_budget(leagues_dir):
     sm.save_league(_league())
@@ -325,11 +351,11 @@ def test_offseason_league_uses_history_views(leagues_dir):
     at = _run()
     text = _text(at)
     assert "planner needs an in-season league" in text
-    _widget(at.multiselect, "Select 2–4 players to compare").select("Ja'Marr Chase").select("Joe Burrow")
+    _widget(at.multiselect, "Select 2–4 players to compare").select("wr1").select("qb1")
     _run(at)
     _widget(at.button, "⚖️ Compare").click()
     _run(at)
-    _widget(at.multiselect, "You Give (from your roster)").select("Bench Guy")
+    _widget(at.multiselect, "You Give (from your roster)").select("wr2")
     _widget(at.multiselect, "You Receive").select("opp1")
     _run(at)
     _widget(at.button, "🤝 Analyze Trade").click()
@@ -408,7 +434,7 @@ def test_bye_week_and_an_already_optimal_full_lineup(leagues_dir):
     text = _text(at)
     assert "Week 3: bye" in text
     assert "lineup is already the best by projection" in text
-    _widget(at.selectbox, "Select player").set_value(0)  # top waiver add: roster is full, so a drop is named
+    _widget(at.selectbox, "Select player").select_index(0)  # top waiver add: roster is full, so a drop is named
     _run(at)
     assert "✂️ Drop:" in _text(at)
 
@@ -417,7 +443,7 @@ def test_league_without_rivals_history_or_standings(leagues_dir):
     sm.save_league(_league(league_rosters=[], transactions=[], budget=1000, playoff_teams=None))
     at = _run()
     text = _text(at)
-    assert "rivals not modeled" in text and "Rival bids weren't modeled" in text
+    assert "treated as uncontested" in text and "rivals not modeled" not in text
     assert "No winning FAAB claims yet" in text and "No completed adds yet" in text
     assert not any("Standings" in e.label for e in at.expander)
 
@@ -520,7 +546,7 @@ def test_three_way_start_sit_with_a_player_missing_stats(leagues_dir):
     sm.save_league(_league())
     at = _run()
     pick = _widget(at.multiselect, "Select 2–4 players to compare")
-    pick.select("Ja'Marr Chase").select("Bench Guy").select("Roster Rookie")
+    pick.select("wr1").select("wr2").select("rk1")
     _run(at)
     _widget(at.button, "⚖️ Compare").click()
     _run(at)
@@ -604,8 +630,10 @@ def test_trades_closed_after_the_deadline(leagues_dir):
 def test_trade_analysis_shows_rest_of_season_projection(leagues_dir):
     sm.save_league(_league())
     at = _run()
-    _widget(at.multiselect, "You Give (from your roster)").select("Bench Guy")
+    _widget(at.multiselect, "You Give (from your roster)").select("wr2")
     _run(at)
     _widget(at.button, "🤝 Analyze Trade").click()
     _run(at)
-    assert "Rest of season, from weekly projections" in [m.label for m in at.metric]
+    assert "Rest of season" in [m.label for m in at.metric]
+    text = _text(at)
+    assert "History view:" in text and "Not counted in either lineup (IR / TAXI): Hurt Back" in text

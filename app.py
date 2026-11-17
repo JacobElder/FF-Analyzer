@@ -1,5 +1,8 @@
 import hmac
+import math
 import os
+import time
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -8,22 +11,24 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
-from src.agent import FantasyAgent
+from src.agent import PROVIDER_LABELS, FantasyAgent, available_providers
 from src.config import load_config
 from src.defense import EMPTY_MATCHUP, build_matchup_table, compute_defense_rankings, get_matchup_info
 from src.evaluator import (
     DEFAULT_ROSTER_POSITIONS, analyze_roster_construction, compute_positional_scarcity,
     injury_factor, player_value, recommend_drop, score_trade, score_waiver, starter_counts,
 )
-from src.formatting import fmt_age, grade_color, lineup_summary, verdict_color
+from src.formatting import fmt_age, fmt_as_of, grade_color, lineup_summary, verdict_color
 from src.injuries import build_injury_map, injury_status, is_inactive
-from src.league_sync import auto_sync, leagues_due, sync_age_seconds
+from src.league_sync import PARTIAL_RETRY_S, auto_sync, leagues_due, sync_age_seconds
+from src.live import game_started
 from src.market import (
-    TARGET_WIN_PROB, faab_log, matchup_projection, playoff_position, risk_mode, standings, waiver_day,
+    TARGET_WIN_PROB, faab_log, playoff_position, risk_mode, standings, waiver_day,
 )
 from src.players import RELEVANT_POSITIONS, build_sleeper_name_index, enrich_with_ids, player_label, sleeper_to_player
 from src.schedule import (
-    fetch_schedules, get_playoff_schedule_strength, get_weather_for_game, next_game_map, playoff_weeks_for,
+    LAST_NFL_WEEK, fetch_schedules, get_playoff_schedule_strength, get_weather_for_game, next_game_map,
+    playoff_weeks_for,
 )
 from src.season import (
     all_week_weights, combined_risk_prob, find_trades, league_dists, median_win_prob, simulate_season, team_week_dist,
@@ -31,15 +36,19 @@ from src.season import (
 )
 from src.scoring import compute_fantasy_points, effective_scoring, scoring_key, scoring_label
 from src.simulator import (
-    _summary, simulate_lineup_change, simulate_player, simulate_trade, win_shares,
+    SCORE_CV, _summary, simulate_lineup_change, simulate_player, simulate_trade, win_shares,
 )
-from src.sleeper_integration import fetch_all_players, players_db_age_seconds, sync_sleeper_league
+from src.sleeper_integration import (
+    GAMEDAY_PLAYERS_TTL, fetch_all_players, players_db_age_seconds, players_db_due, sync_sleeper_league,
+)
 from src.state_manager import list_leagues, load_league, save_league
-from src.storage import DATA_DIR
+from src.storage import DATA_DIR, DataUnavailable
 from src.projections import Projections
-from src.valuation import ValuationContext, fantasy_weeks, lineup_suggestions, lineup_totals, team_week_opponents
-from src.vegas import fetch_implied_totals
-from src.waiver_analysis import analyze_waiver_pool, build_claim_plan
+from src.valuation import (
+    NON_LINEUP_SLOTS, ValuationContext, fantasy_weeks, lineup_suggestions, lineup_totals, team_week_opponents,
+)
+from src.vegas import fetch_implied_totals, vegas_status
+from src.waiver_analysis import analyze_waiver_pool, build_claim_plan, faab_enabled as league_uses_faab
 from src.wrangler import StatsIndex, current_nfl_season, fetch_weekly_stats
 
 load_dotenv()
@@ -48,6 +57,10 @@ st.set_page_config(page_title="FF Analyzer", layout="wide")
 st.title("🏈 FF Analyzer")
 
 STALE_SYNC_DAYS = 2
+MAX_PASSWORD_ATTEMPTS = 5     # wrong AI passwords per session before a lockout
+PASSWORD_LOCKOUT_S = 30       # first lockout; doubles with every further wrong password
+MAX_AI_CALLS = 30             # AI requests per browser session
+PLAYERS_RETRY_S = 10 * 60     # while the player DB can't be refreshed, retry the download this often
 
 
 # ── Cached loaders ────────────────────────────────────────────────────────────
@@ -66,11 +79,11 @@ def load_schedules():
 def load_next_games():
     return next_game_map(load_schedules())
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)  # the file cache underneath holds odds for 4 hours
 def load_vegas():
     return fetch_implied_totals()
 
-@st.cache_resource(ttl=6 * 3600, show_spinner="Loading Sleeper player database…")
+@st.cache_resource(ttl=GAMEDAY_PLAYERS_TTL, show_spinner="Loading Sleeper player database…")
 def load_players_db():
     db = fetch_all_players()
     name_index = build_sleeper_name_index(db)
@@ -92,14 +105,14 @@ def load_analytics(scoring_items: tuple, num_teams: int, roster_positions: tuple
     return index, matchups, repl
 
 @st.cache_resource(ttl=3 * 3600, max_entries=6, show_spinner="Projecting the rest of the season…")
-def load_context(key: tuple, _index, _matchups, _vegas, _players_db, _injury_map):
+def load_context(key: tuple, _index, _matchups, _vegas, _players_db, _injury_map, _league):
     """
     Week-by-week valuation context for one league sync. `key` =
     (league_key, synced_at, scoring_key, season, week, playoff_week_start); the
     underscored arguments are derived from it and skipped by Streamlit's hashing.
     """
     _, _, scoring_items, season, week, playoff_start = key
-    weeks = fantasy_weeks(week, playoff_start)
+    weeks = fantasy_weeks(week, playoff_start, settings=_league)
     # Only weeks before the current one are final. nflverse has stats for the current week as soon as
     # Thursday's game is played, so its last week would freeze this week's projections mid-week.
     proj = Projections(int(season), weeks, dict(scoring_items), completed_through=int(week) - 1) if weeks else None
@@ -134,12 +147,27 @@ def load_trade_ideas(key: tuple, _roster, _league, _ctx, _players_db, _weights, 
 def cached_weather(home_team: str, gameday: str):
     return get_weather_for_game(home_team, gameday)
 
+@st.cache_data(ttl=3 * 3600, max_entries=256, show_spinner=False)
+def sim_samples(player_key: str, name: str, stats_hash: str, center, _stats) -> np.ndarray:
+    """Monte Carlo draws for one player, cached by player ID + stats + this week's center (projection)."""
+    return simulate_player(_stats, name, center=center)
+
+def stats_hash(s: dict) -> str:
+    return repr((s.get("weekly"), (s.get("recent") or {}).get("ppg"), (s.get("season") or {}).get("ppg")))
+
+def samples_for(p: dict, s: dict, center=None) -> np.ndarray:
+    return sim_samples(pkey(p), p["name"], stats_hash(s), center, s)
+
+def pkey(p: dict) -> str:
+    """Stable per-player key: the Sleeper ID, or the name for players without one."""
+    return p.get("player_id") or p["name"]
+
 
 def refresh_all_data():
     fetch_weekly_stats(force=True)
     fetch_schedules(force=True)
     fetch_all_players(force=True)
-    fetch_implied_totals()  # not forced: odds requests count against a monthly quota, so keep the 1-hour cache
+    fetch_implied_totals()  # not forced: odds requests count against a monthly quota, so keep the 4-hour cache
     for path in DATA_DIR.glob("projections_*.json"):  # re-fetched on demand
         path.unlink(missing_ok=True)
     st.cache_data.clear()
@@ -148,26 +176,45 @@ def refresh_all_data():
 
 # ── Sidebar: settings, data, league ───────────────────────────────────────────
 
-if "ai_provider" not in st.session_state:
-    # Default to whichever provider has a key configured
-    st.session_state.ai_provider = "gemini" if os.getenv("GOOGLE_API_KEY") and not os.getenv("ANTHROPIC_API_KEY") else "claude"
-
 st.sidebar.header("⚙️ Settings")
-st.session_state.ai_provider = st.sidebar.radio(
-    "AI Provider", ["claude", "gemini"],
-    index=0 if st.session_state.ai_provider == "claude" else 1,
-    format_func=lambda x: "Claude (Anthropic)" if x == "claude" else "Gemini (Google)",
-)
+# Only providers with an API key configured are offered
+AI_PROVIDERS = available_providers()
+if AI_PROVIDERS:
+    if st.session_state.get("ai_provider") not in AI_PROVIDERS:
+        st.session_state.ai_provider = AI_PROVIDERS[0]
+    st.sidebar.radio("AI Provider", AI_PROVIDERS, key="ai_provider", format_func=PROVIDER_LABELS.get)
+else:
+    st.sidebar.caption("AI narratives are off: add `ANTHROPIC_API_KEY` or `GOOGLE_API_KEY` to .env or "
+                       "Streamlit Secrets.")
+
 # Optional password for the AI buttons (AI_PASSWORD in .env or Streamlit secrets), so a shared
 # copy of the app can hold an API key without strangers spending it. Unset = AI open, as locally.
+# After MAX_PASSWORD_ATTEMPTS wrong tries the box locks for PASSWORD_LOCKOUT_S, doubling each time.
 AI_PASSWORD = os.getenv("AI_PASSWORD", "")
-if AI_PASSWORD and not st.session_state.get("ai_unlocked"):
-    entered = st.sidebar.text_input("🔒 AI password", type="password", help="Unlocks the AI analysis buttons")
-    if entered and hmac.compare_digest(entered.encode(), AI_PASSWORD.encode()):
+
+
+def _check_ai_password():
+    entered = st.session_state.get("ai_pw", "")
+    st.session_state.ai_pw = ""
+    if hmac.compare_digest(entered.encode(), AI_PASSWORD.encode()):
         st.session_state.ai_unlocked = True
-        st.rerun()
-    elif entered:
-        st.sidebar.error("Wrong password.")
+        return
+    fails = st.session_state.get("ai_pw_fails", 0) + 1
+    st.session_state.ai_pw_fails = fails
+    st.session_state.ai_pw_error = True
+    if fails >= MAX_PASSWORD_ATTEMPTS:
+        st.session_state.ai_locked_until = time.time() + PASSWORD_LOCKOUT_S * 2 ** (fails - MAX_PASSWORD_ATTEMPTS)
+
+
+if AI_PASSWORD and AI_PROVIDERS and not st.session_state.get("ai_unlocked"):
+    locked_for = st.session_state.get("ai_locked_until", 0) - time.time()
+    if locked_for > 0:
+        st.sidebar.error(f"Too many wrong passwords — try again in {math.ceil(locked_for)} s.")
+    else:
+        st.sidebar.text_input("🔒 AI password", type="password", key="ai_pw", on_change=_check_ai_password,
+                              help="Unlocks the AI analysis buttons")
+        if st.session_state.pop("ai_pw_error", False):
+            st.sidebar.error("Wrong password.")
 
 if st.sidebar.button("🔄 Refresh data", help="Re-download stats, schedule, Sleeper players/injuries, projections and odds"):
     with st.spinner("Refreshing all data sources…"):
@@ -184,15 +231,24 @@ SYNC_MAX_AGE = CONFIG["auto_sync_minutes"] * 60
 @st.cache_resource
 def _sync_state():
     """Process-wide auto-sync bookkeeping: last attempt time and last error per league."""
-    return {"attempts": {}, "errors": {}}
+    return {"attempts": {}, "errors": {}, "players_cleared": 0.0}
 
 
 # Load the Sleeper player database first: the league syncs below (run in parallel) all need it,
 # and this way it's downloaded once instead of once per league
-_players_db, _name_index, _injury_map, _trade_pool = load_players_db()
+_sync = _sync_state()
+# Injury news moves fast on game days: drop the in-memory copy once the file cache is due for a
+# refresh (throttled, so a Sleeper outage doesn't mean a download attempt on every rerun)
+if players_db_due() and time.time() - _sync["players_cleared"] > PLAYERS_RETRY_S:
+    _sync["players_cleared"] = time.time()
+    load_players_db.clear()
+try:
+    _players_db, _name_index, _injury_map, _trade_pool = load_players_db()
+except DataUnavailable as e:  # not cached: the next rerun tries again
+    st.error(f"{e}. Check your connection and click **🔄 Refresh data** to retry.")
+    _players_db, _name_index, _injury_map, _trade_pool = {}, {}, {}, []
 
 # Keep the default leagues current: re-sync any whose saved data is older than auto_sync_minutes
-_sync = _sync_state()
 if CONFIG["username"] and leagues_due(CONFIG["league_ids"], SYNC_MAX_AGE, _sync["attempts"]):
     with st.spinner("Updating your leagues from Sleeper…"):
         due = leagues_due(CONFIG["league_ids"], SYNC_MAX_AGE, _sync["attempts"])
@@ -238,7 +294,11 @@ with st.sidebar.expander("➕ Add another Sleeper league", expanded=not leagues)
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-_weekly_df = load_weekly_stats()
+try:
+    _weekly_df = load_weekly_stats()
+except DataUnavailable as e:  # not cached: the next rerun tries again
+    st.error(f"{e}. Check your connection and click **🔄 Refresh data** to retry.")
+    st.stop()
 if _weekly_df.empty:
     st.error("Couldn't load NFL stats from nflverse and no cached copy exists. "
              "Check your connection and click **🔄 Refresh data**.")
@@ -255,7 +315,7 @@ _index, _matchups, _repl_levels = load_analytics(scoring_key(scoring), num_teams
 
 roster = enrich_with_ids(current_data.get("roster", []), _players_db, _name_index)
 waivers = enrich_with_ids(current_data.get("waivers", []), _players_db, _name_index)
-playoff_weeks = playoff_weeks_for(current_data.get("playoff_week_start"))
+playoff_weeks = playoff_weeks_for(current_data.get("playoff_week_start"), current_data)
 
 _season_year = _index.season
 _current_season = current_nfl_season()
@@ -265,7 +325,11 @@ if _schedules_df.empty:
     status_bits.append("Schedule unavailable")
 db_age = players_db_age_seconds()
 if db_age is not None:
-    status_bits.append(f"Injuries as of {db_age / 3600:.0f}h ago")
+    status_bits.append(fmt_as_of("Injuries", db_age))
+odds = vegas_status()
+if odds["fetched_at"] is not None:
+    status_bits.append(fmt_as_of("Odds", time.time() - odds["fetched_at"])
+                       + (f" ({odds['remaining']} API credits left)" if odds["remaining"] is not None else ""))
 st.caption(" · ".join(status_bits))
 if _season_year and _season_year < _current_season:
     st.info(f"No {_current_season} stats yet — values use the {_season_year} season. "
@@ -296,6 +360,14 @@ if current_data:
         st.sidebar.warning("Sync time unknown (older file). Sync to refresh the roster and waiver pool.")
     if err := _sync["errors"].get(selected_league):
         st.sidebar.warning(f"Auto-sync failed: {err.rstrip('.')}. Showing the last saved data.")
+    # A sync whose secondary requests failed carries those parts forward from the previous one
+    missing_parts = sorted(set(current_data.get("partial") or [])
+                           | ({"schedule"} if current_data.get("schedule_complete") is False else set()))
+    if missing_parts:
+        st.warning(f"The last Sleeper sync couldn't load: {', '.join(missing_parts)}. Those parts show the "
+                   "previous sync's data"
+                   + (f"; it retries automatically within {PARTIAL_RETRY_S // 60} minutes." if is_default
+                      else " — click **🔄 Sync this league now** to retry."))
 
     if current_data.get("league_id") and st.sidebar.button("🔄 Sync this league now"):
         with st.spinner("Syncing from Sleeper..."):
@@ -319,7 +391,7 @@ if current_data:
                          f"**Lineup:** {lineup_summary(current_data.get('roster_positions') or DEFAULT_ROSTER_POSITIONS)}",
                          f"**Scoring:** {scoring_label(scoring)}"]
         settings_rows += [f"- {label}: {scoring[key]:+g}" for key, label in _NOTABLE_SCORING if scoring.get(key)]
-        if current_data.get("faab_enabled", True):
+        if league_uses_faab(current_data):
             total = current_data.get("waiver_budget_total")
             settings_rows.append("**Waivers:** FAAB" + (f", ${total} season budget" if total else ""))
         else:
@@ -331,13 +403,18 @@ if current_data:
         st.markdown("\n\n".join(settings_rows))
 
 synced_budget = int(current_data.get("budget", 100))
-faab_enabled = current_data.get("faab_enabled", True)
-with st.sidebar.expander("💰 FAAB Budget", expanded=True):
-    if not faab_enabled:
-        st.caption("This league doesn't use FAAB — bids are shown for reference only.")
-    budget = st.number_input("Remaining Budget ($)", min_value=0, max_value=10000, value=synced_budget, step=1,
-                             key=f"budget_{selected_league}",
-                             help="Synced from Sleeper. Change it to test bids; it isn't saved.")
+faab_on = league_uses_faab(current_data)
+my_waiver_pos = (current_data.get("record") or {}).get("waiver_position")
+if faab_on:
+    with st.sidebar.expander("💰 FAAB Budget", expanded=True):
+        budget = st.number_input("Remaining Budget ($)", min_value=0, max_value=10000, value=synced_budget, step=1,
+                                 key=f"budget_{selected_league}",
+                                 help="Synced from Sleeper. Change it to test bids; it isn't saved.")
+else:
+    budget = synced_budget
+    with st.sidebar.expander("🔢 Waiver priority", expanded=True):
+        st.caption("This league doesn't use FAAB — claims go by waiver priority"
+                   + (f"; you're #{my_waiver_pos}." if my_waiver_pos else "."))
 
 
 # ── Per-player helpers ────────────────────────────────────────────────────────
@@ -380,8 +457,10 @@ def player_context(p, s=None) -> dict:
     return ctx
 
 
-roster_by_name = {p["name"]: p for p in roster}
-roster_stats = {p["name"]: stats_for(p) for p in roster}
+roster_by_id = {pkey(p): p for p in roster}
+roster_stats = {pkey(p): stats_for(p) for p in roster}
+# Evaluator functions (drops, trades, roster grades) take stats keyed by name
+stats_by_name = {p["name"]: roster_stats[pkey(p)] for p in roster}
 
 
 # ── Rest-of-season engine (projections, lineup gains, FAAB market) ───────────
@@ -392,27 +471,70 @@ _engine_key = (selected_league, current_data.get("synced_at"), scoring_key(scori
                current_data.get("week"), current_data.get("playoff_week_start"))
 ctx = None
 if roster and current_data.get("week") and str(current_data.get("season", "")).isdigit():
-    ctx = load_context(_engine_key, _index, _matchups, _vegas_totals, _players_db, _injury_map)
+    ctx = load_context(_engine_key, _index, _matchups, _vegas_totals, _players_db, _injury_map, current_data)
     if not ctx.weeks:
         ctx = None
 # Playoff odds weight every rest-of-season value: a playoff week counts by the chance of being there
 team_dists, season_sim = load_season(_engine_key, ctx, current_data, _players_db) if ctx else ({}, None)
 my_p_playoffs = season_sim["p_playoffs"].get(current_data.get("roster_id")) if season_sim else None
+my_p_bye = season_sim["p_bye"].get(current_data.get("roster_id")) if season_sim else None
 playoff_start = current_data.get("playoff_week_start")
-my_weights = week_weights(ctx.weeks, playoff_start, my_p_playoffs) if ctx else None
-rival_weights = all_week_weights(season_sim, ctx.weeks, playoff_start) if ctx else {}
+my_weights = week_weights(ctx.weeks, playoff_start, my_p_playoffs, current_data, my_p_bye) if ctx else None
+rival_weights = all_week_weights(season_sim, ctx.weeks, playoff_start, current_data) if ctx else {}
+# Rest-of-season gains count playoff weeks by the chance of being there (see season.week_weights)
+WEIGHTED = " (playoff-weighted)" if my_p_playoffs is not None else ""
 engine = load_waiver_engine(_engine_key, int(budget), ctx, roster, waivers, current_data, _players_db,
                             my_weights, rival_weights) if ctx and waivers else None
-candidate_by_id = {c.get("player_id") or c["name"]: c for c in (engine or {}).get("candidates", [])}
+candidate_by_id = {pkey(c): c for c in (engine or {}).get("candidates", [])}
+faab_on = engine["faab"] if engine else faab_on
 week_now = ctx.current_week if ctx else None
+_now = datetime.now(timezone.utc)
+rival_rosters = [r for r in current_data.get("league_rosters") or [] if r["roster_id"] != current_data.get("roster_id")]
 if ctx and not (ctx.projections and ctx.projections.available):
     st.warning("Sleeper projections are unavailable right now — values use past production only.")
 
 
 # This week's outlook, shared by the Roster and Who to Start tabs: the head-to-head game and,
 # in leagues that use one, the league-median game (a win for finishing in the top half)
+def locked(p) -> bool:
+    """His game this week has kicked off, so he can't be moved in or out of the lineup."""
+    return bool(p.get("team")) and game_started(p["team"], _now, _schedules_df, week_now)
+
+
+def live_projection(my_ids: list, opp_ids: list, my_points: dict, opp_points: dict) -> dict | None:
+    """
+    This week's projected final score for both lineups: points already scored by starters whose
+    game has kicked off, plus the projection for those still to play. Win chance from a normal
+    approximation over the players still to play (weekly scores vary by about SCORE_CV of the mean).
+    """
+    if not my_ids or not opp_ids:
+        return None
+    live = False
+
+    def side(pids, points):
+        nonlocal live
+        total, var = 0.0, 0.0
+        for pid in pids:
+            p = sleeper_to_player(pid, _players_db.get(pid, {}))
+            if locked(p):
+                live = True
+                total += points.get(pid) or 0.0
+            else:
+                v = ctx.week_values(p)[week_now]
+                total += v
+                var += (SCORE_CV * v) ** 2
+        return total, var
+
+    mine, var_m = side(my_ids, my_points)
+    theirs, var_t = side(opp_ids, opp_points)
+    sd = math.sqrt(var_m + var_t)
+    p_win = 0.5 * (1 + math.erf((mine - theirs) / (sd * math.sqrt(2)))) if sd else float(mine > theirs) + 0.5 * (mine == theirs)
+    return {"mine": round(mine, 1), "theirs": round(theirs, 1), "p_win": round(p_win, 3), "live": live}
+
+
 mu = current_data.get("matchup") or {}
-mu_proj = matchup_projection(mu.get("starters") or [], mu.get("opponent_starters") or [], ctx, _players_db) \
+mu_proj = live_projection(mu.get("starters") or [], mu.get("opponent_starters") or [],
+                          mu.get("players_points") or {}, mu.get("opponent_players_points") or {}) \
     if ctx and mu.get("opponent") else None
 p_median = None
 if ctx and current_data.get("median_game") and mu.get("starters"):
@@ -488,14 +610,25 @@ def candidate_notes(c: dict) -> str:
 
 
 def _ai_block(state_key: str, request_id, button_label: str, run):
-    """AI button whose output survives reruns (keyed to the current request)."""
+    """
+    AI button whose output survives reruns. The answer is stored with its request, so the same
+    request is never sent twice; each session gets at most MAX_AI_CALLS requests.
+    """
+    if not AI_PROVIDERS:
+        st.caption("🔑 Add `ANTHROPIC_API_KEY` or `GOOGLE_API_KEY` to .env or Streamlit Secrets to use this.")
+        return
     if AI_PASSWORD and not st.session_state.get("ai_unlocked"):
         st.caption("🔒 Enter the AI password in the sidebar to use this.")
         return
-    if st.button(button_label, key=f"{state_key}_btn"):
-        with st.spinner(f"Analyzing with {st.session_state.ai_provider}..."):
-            st.session_state[state_key] = (request_id, run())
     stored = st.session_state.get(state_key)
+    if not (stored and stored[0] == request_id) and st.button(button_label, key=f"{state_key}_btn"):
+        calls = st.session_state.get("ai_calls", 0)
+        if calls >= MAX_AI_CALLS:
+            st.warning(f"AI limit reached for this session ({MAX_AI_CALLS} requests).")
+        else:
+            st.session_state.ai_calls = calls + 1
+            with st.spinner(f"Analyzing with {PROVIDER_LABELS[st.session_state.ai_provider]}…"):
+                stored = st.session_state[state_key] = (request_id, run())
     if stored and stored[0] == request_id:
         st.markdown(stored[1])
 
@@ -513,7 +646,7 @@ tab_roster, tab_waivers, tab_planner, tab_start_sit, tab_trade, tab_roster_mgmt 
 _INJURY_COL = {"Injury": st.column_config.TextColumn(width=110)}  # fits "Questionable"
 _SHORT_SLOT = {"SUPER_FLEX": "SFLEX", "WRRB_FLEX": "W/R", "REC_FLEX": "W/T", "IDP_FLEX": "IDP"}
 _SLOT_ORDER = {slot: i for i, slot in enumerate(dict.fromkeys(
-    [s for s in roster_positions if s not in ("BN", "IR", "TAXI")] + ["BN", "IR", "Taxi"]))}
+    [s for s in roster_positions if s not in NON_LINEUP_SLOTS] + ["BN", "IR", "TAXI"]))}
 
 with tab_roster:
     st.subheader(current_data.get("team_name") or "Your Roster")
@@ -521,25 +654,34 @@ with tab_roster:
         st.info("Sync a league from the sidebar.")
     else:
         lineup = lineup_suggestions(roster, ctx, roster_positions) if ctx else None
+        # Players whose game has kicked off are locked in Sleeper: only suggest swaps that can still be made
+        by_name = {p["name"]: p for p in roster}
+        swaps = [s_ for s_ in (lineup or {}).get("swaps", [])
+                 if not locked(by_name[s_["in"]]) and not (s_["out"] and locked(by_name[s_["out"]]))]
+        skipped = len((lineup or {}).get("swaps", [])) - len(swaps)
         if mu and mu.get("bye"):
             st.caption(f"Week {mu['week']}: bye")
         elif mu and mu.get("opponent"):
             opp_rec = mu.get("opponent_record") or {}
             opp_rec_str = f" ({opp_rec.get('wins', 0)}-{opp_rec.get('losses', 0)})" if opp_rec else ""
             proj_mu = mu_proj
-            live = (mu.get("points") or 0) + (mu.get("opponent_points") or 0) > 0
             mc1, mc2, mc3, mc4 = st.columns(4)
             if proj_mu:
-                mc1.metric(f"Week {mu['week']} — You (projected)", f"{proj_mu['mine']:g}",
+                live = proj_mu["live"]
+                how = "live + projected" if live else "projected"
+                mc1.metric(f"Week {mu['week']} — You ({how})", f"{proj_mu['mine']:g}",
                            f"{mu['points']:g} scored so far" if live else None, delta_color="off")
                 mc2.metric(f"{mu['opponent']}{opp_rec_str}", f"{proj_mu['theirs']:g}",
                            f"{mu['opponent_points']:g} scored so far" if live else None, delta_color="off")
                 mc3.metric("Win chance (current lineup)", f"{proj_mu['p_win']:.0%}")
-                if lineup and lineup["swaps"]:
-                    fixed_ids = [roster_by_name[s_["name"]].get("player_id")
-                                 for s_ in lineup["optimal"]["starters"] if s_["name"]]
+                if swaps:
+                    outs, ins = {s_["out"] for s_ in swaps}, {s_["in"] for s_ in swaps}
+                    fixed_ids = [p.get("player_id") for p in roster
+                                 if (p.get("slot") and p.get("slot") not in NON_LINEUP_SLOTS and p["name"] not in outs)
+                                 or p["name"] in ins]
                     # Always computable here: both starter lists are non-empty once fixes exist
-                    fixed = matchup_projection(fixed_ids, mu.get("opponent_starters") or [], ctx, _players_db)
+                    fixed = live_projection(fixed_ids, mu.get("opponent_starters") or [],
+                                            mu.get("players_points") or {}, mu.get("opponent_players_points") or {})
                     mc4.metric("Win chance with fixes below", f"{fixed['p_win']:.0%}",
                                f"{fixed['p_win'] - proj_mu['p_win']:+.0%}")
                 if p_median is not None:
@@ -547,7 +689,9 @@ with tab_roster:
                     md1.metric("Median game: top-half finish", f"{p_median:.0%}",
                                help="This league also scores every team against the league median each week.")
                     md2.metric("Expected wins this week", f"{proj_mu['p_win'] + p_median:.1f} of 2")
-                st.caption(f"Projections for both starting lineups as set in Sleeper at the last sync. "
+                st.caption(("Points already scored by starters whose game has kicked off, plus projections for "
+                            "the rest, " if live else "Projections for ")
+                           + "both starting lineups as set in Sleeper at the last sync. "
                            f"Suggested start/sit style this week: **{risk_mode(risk_p)}** "
                            + ("based on both games, head-to-head and the median " if p_median is not None else "")
                            + "(favorites should cut variance, underdogs should chase upside).")
@@ -556,31 +700,33 @@ with tab_roster:
                 mc2.metric(f"{mu['opponent']}{opp_rec_str}", f"{mu['opponent_points']:g}")
                 mc3.caption("Live points from Sleeper as of the last sync.")
 
-        if lineup and lineup["swaps"]:
+        if swaps:
             st.markdown(f"#### 🔁 Lineup fixes for week {week_now} "
-                        f"(+{lineup['optimal_total'] - lineup['current_total']:.1f} projected pts)")
+                        f"(+{sum(s_['gain'] for s_ in swaps):.1f} projected pts)")
             st.dataframe(pd.DataFrame([{"Slot": s_["slot"], "Bench": s_["out"] or "(empty)", "Start": s_["in"],
-                                        "+Pts": s_["gain"], "Why": s_["reason"]} for s_ in lineup["swaps"]]),
+                                        "+Pts": s_["gain"], "Why": s_["reason"]} for s_ in swaps]),
                          hide_index=True, width="stretch")
             st.caption("Make these in the Sleeper app — Sleeper's public API is read-only, so this app can't "
                        "change your lineup. Re-sync afterwards to clear this list.")
         else:
             has_slots = any(p.get("slot") for p in roster)
             flagged = [p["name"] for p in roster
-                       if p.get("slot") not in (None, "BN", "IR", "Taxi") and is_inactive(inj_for(p))]
+                       if p.get("slot") not in (None, *NON_LINEUP_SLOTS) and is_inactive(inj_for(p))]
             if flagged:
                 st.error(f"🚨 Starting an inactive player: {', '.join(flagged)} — swap them out in Sleeper.")
-            n_starting = len([s_ for s_ in roster_positions if s_ not in ("BN", "IR", "TAXI")])
-            n_started = len([p for p in roster if p.get("slot") not in (None, "BN", "IR", "Taxi")])
+            n_starting = len([s_ for s_ in roster_positions if s_ not in NON_LINEUP_SLOTS])
+            n_started = len([p for p in roster if p.get("slot") not in (None, *NON_LINEUP_SLOTS)])
             if has_slots and n_started < n_starting:
                 st.warning(f"⚠️ {n_starting - n_started} empty starting slot(s) in your Sleeper lineup.")
-            elif lineup:
+            elif lineup and not skipped:
                 st.success(f"✅ Your week {week_now} lineup is already the best by projection.")
+        if skipped:
+            st.caption(f"🔒 {skipped} better lineup move(s) left out: those players' games have already kicked off.")
 
         has_slots = any(p.get("slot") for p in roster)
         rows = []
         for p in sorted(roster, key=lambda p: _SLOT_ORDER.get(p.get("slot"), len(_SLOT_ORDER))):
-            s = roster_stats[p["name"]]
+            s = roster_stats[pkey(p)]
             next_g, m = matchup_for(p)
             rows.append({
                 **({"Slot": _SHORT_SLOT.get(p.get("slot"), p.get("slot", ""))} if has_slots else {}),
@@ -597,7 +743,8 @@ with tab_roster:
         st.dataframe(df_roster, hide_index=True, width="stretch", column_config=_INJURY_COL)
         if ctx:
             st.caption(f"Proj = 80% Sleeper projection + 20% this season's production, adjusted for byes, injuries "
-                       f"(estimated return weeks) and matchup. ROS = sum over weeks {ctx.weeks[0]}–{ctx.weeks[-1]}.")
+                       f"(estimated return weeks) and matchup. ROS Proj = his projected points summed over weeks "
+                       f"{ctx.weeks[0]}–{ctx.weeks[-1]}, every week counted fully.")
 
         league_rosters = current_data.get("league_rosters") or []
         if league_rosters:
@@ -651,20 +798,27 @@ with tab_waivers:
     else:
         if engine:
             worth = [c for c in engine["candidates"] if c["gain_total"] > 0]
-            st.markdown(f"#### 🎯 Bid recommendations — ${budget} left, {engine['weeks_left']} weeks to go")
+            if faab_on:
+                st.markdown(f"#### 🎯 Bid recommendations — ${budget} left, {engine['weeks_left']} weeks to go")
+            else:
+                st.markdown(f"#### 🎯 Waiver targets — priority #{my_waiver_pos or '?'}, "
+                            f"{engine['weeks_left']} weeks to go")
             st.caption("Ranked by how much each player improves **your best starting lineup** from now through the "
-                       "fantasy playoffs, after dropping your least valuable player. Bids are priced from this "
-                       "league's past winning bids and which rivals would also want the player. "
-                       "The **🧾 FAAB Planner** tab turns this into a set of claims that fit your budget."
+                       "fantasy playoffs, after dropping your least valuable player. "
+                       + ("Bids are priced from this league's past winning bids and which rivals would also want "
+                          "the player. The **🧾 FAAB Planner** tab turns this into a set of claims that fit your budget."
+                          if faab_on else
+                          "No FAAB here: P(win) is the chance no interested rival ahead of you in waiver priority "
+                          "claims him first.")
                        + (f" Playoff weeks count by your {my_p_playoffs:.0%} playoff chances (halved for each later "
-                          "round), so points sooner are worth more when the playoffs are uncertain."
-                          if my_p_playoffs is not None else ""))
+                          "round; bye seeds skip round 1), so points sooner are worth more when the playoffs are "
+                          "uncertain." if my_p_playoffs is not None else ""))
             if worth:
                 st.dataframe(pd.DataFrame([{
                     "Player": c["name"], "Pos": c.get("position"), "Team": c.get("team"),
-                    "+Pts/wk": c["gain_per_week"], "+Pts ROS": c["gain_total"],
+                    f"+Pts/wk{WEIGHTED}": c["gain_per_week"], f"+Pts ROS{WEIGHTED}": c["gain_total"],
                     "Drop": c["drop_name"] or "(open spot)",
-                    "Worth to you": c["max_pay"], "Bid": c["suggested_bid"],
+                    **({"Worth to you": c["max_pay"], "Bid": c["suggested_bid"]} if faab_on else {}),
                     "P(win)": c["p_win"] if c["p_win_known"] else None,
                     "Rivals interested": c["interested_rivals"] if c["rivals"] else None,
                     "Notes": candidate_notes(c),
@@ -673,7 +827,8 @@ with tab_waivers:
                                    "Bid": st.column_config.NumberColumn(format="$%d"),
                                    "P(win)": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1)})
             else:
-                st.info("No available player improves your starting lineup — save your FAAB this week.")
+                st.info("No available player improves your starting lineup — "
+                        + ("save your FAAB this week." if faab_on else "keep your waiver priority this week."))
             st.divider()
             st.markdown("#### Browse the pool")
 
@@ -712,9 +867,11 @@ with tab_waivers:
         if not enriched_sorted:
             st.caption("No players match the current filters.")
         else:
-            sel_i = st.selectbox("Select player", range(len(enriched_sorted)),
-                                 format_func=lambda i: player_label(enriched_sorted[i]))
-            p_data = enriched_sorted[sel_i]
+            # Options are player IDs under a fixed key, so re-sorting or filtering keeps the same player selected
+            pool_by_id = {pkey(p): p for p in enriched_sorted}
+            sel_id = st.selectbox("Select player", list(pool_by_id), key=f"waiver_pick_{selected_league}",
+                                  format_func=lambda k: player_label(pool_by_id[k]))
+            p_data = pool_by_id[sel_id]
             selected_waiver = p_data["name"]
             pos = p_data.get("position", "")
             team = p_data.get("team", "")
@@ -727,13 +884,20 @@ with tab_waivers:
 
             ws = score_waiver(player_stats, pos, p_data.get("trend_count", 0),
                               defense_multiplier=def_info["multiplier"], replacement_levels=_repl_levels)
-            drop = recommend_drop(pos, roster, roster_stats, _repl_levels) if roster else None
-
-            cand = candidate_by_id.get(p_data.get("player_id") or p_data["name"])
+            cand = candidate_by_id.get(pkey(p_data))
+            # The drop to compare against: the engine's pick (cheapest over the rest of the season) when
+            # it ran, else the history-based recommendation
+            if engine:
+                drop_player = cand["drop"] if cand else None
+                drop = None
+            else:
+                drop = recommend_drop(pos, roster, stats_by_name, _repl_levels)
+                drop_player = next((p for p in roster if p["name"] == drop["name"]), None) if drop else None
             col_g, col_m = st.columns([1, 2])
             with col_g:
-                st.plotly_chart(_score_gauge(ws["score"], "Generic value score"), width="stretch")
-                st.caption("Player quality vs. a replacement-level player — not specific to your roster.")
+                st.plotly_chart(_score_gauge(ws["score"], "History score"), width="stretch")
+                st.caption("Past production vs. a replacement-level player — not specific to your roster"
+                           + (". The call on the right comes from your projected lineup gain." if engine else "."))
             with col_m:
                 if engine:
                     gain_wk = cand["gain_per_week"] if cand else 0
@@ -755,13 +919,21 @@ with tab_waivers:
                     if cand and cand["gain_total"] > 0:
                         bid_amount = cand["suggested_bid"]
                         b1, b2, b3 = st.columns(3)
-                        b1.metric("Suggested bid", f"${bid_amount}",
-                                  f"{cand['p_win']:.0%} to win" if cand["p_win_known"] else None, delta_color="off")
-                        b2.metric("Worth to you (max)", f"${cand['max_pay']}",
-                                  help="His rest-of-season lineup gain relative to a typical good add, "
-                                       "priced so your budget lasts the season.")
+                        if faab_on:
+                            b1.metric("Suggested bid", f"${bid_amount}",
+                                      f"{cand['p_win']:.0%} to win" if cand["p_win_known"] else None,
+                                      delta_color="off")
+                            b2.metric("Worth to you (max)", f"${cand['max_pay']}",
+                                      help="His rest-of-season lineup gain relative to a typical good add, "
+                                           "priced so your budget lasts the season.")
+                        else:
+                            b1.metric("Claim odds", f"{cand['p_win']:.0%}" if cand["p_win_known"] else "—",
+                                      help="Chance no interested rival ahead of you in waiver priority claims him.")
+                            b2.metric("Your waiver priority", f"#{my_waiver_pos}" if my_waiver_pos else "—")
                         b3.metric("Lineup gain", f"+{cand['gain_per_week']:.1f} pts/wk",
-                                  f"+{cand['gain_total']:.0f} rest of season", delta_color="off")
+                                  f"+{cand['gain_total']:.0f} rest of season{WEIGHTED}", delta_color="off",
+                                  help="Per week = the weighted gain ÷ the weighted weeks you'd hold him "
+                                       "(2 weeks for a DEF/K streamer).")
                         st.caption(cand["bid_note"])
                         if cand["drop_name"]:
                             st.markdown(f"**✂️ Drop:** {cand['drop_name']} — the roster spot that costs your "
@@ -770,14 +942,17 @@ with tab_waivers:
                             st.caption(notes)
                     else:
                         bid_amount = 0
-                        st.metric("Suggested bid", "$0")
+                        st.metric("Suggested bid" if faab_on else "Claim", "$0" if faab_on else "Pass")
                         st.caption("He wouldn't improve your best starting lineup in any remaining week"
                                    + ("." if cand else " (not among the top projected players in the pool)."))
                 else:
-                    bid_amount = round(ws["faab_bid_pct"] * budget)
-                    st.metric("Recommended FAAB Bid", f"${bid_amount}",
-                              help=f"{ws['faab_bid_pct'] * 100:.0f}% of your ${budget} remaining budget "
-                                   "(formula fallback — no current week to project).")
+                    bid_amount = round(ws["faab_bid_pct"] * budget) if faab_on else 0
+                    if faab_on:
+                        st.metric("Recommended FAAB Bid", f"${bid_amount}",
+                                  help=f"{ws['faab_bid_pct'] * 100:.0f}% of your ${budget} remaining budget "
+                                       "(formula fallback — no current week to project).")
+                    else:
+                        st.caption("No FAAB in this league — claims go by waiver priority.")
                     if drop:
                         drop_color = "red" if drop["surplus"] < 0 else "orange"
                         st.markdown(f"**✂️ Drop:** :{drop_color}[{drop['name']}]"
@@ -788,14 +963,17 @@ with tab_waivers:
                 with bc1:
                     gain_df = pd.DataFrame({"Week": list(cand["weekly_gain"]),
                                             "Lineup gain": list(cand["weekly_gain"].values())})
-                    fig = px.bar(gain_df, x="Week", y="Lineup gain", title="Your lineup gain by week (projected)")
+                    fig = px.bar(gain_df, x="Week", y="Lineup gain",
+                                 title="Your lineup gain by week (projected, unweighted)")
                     for w in playoff_weeks:
                         fig.add_vrect(x0=w - 0.5, x1=w + 0.5, fillcolor="gold", opacity=0.12, line_width=0)
                     fig.update_layout(height=320, margin=dict(t=50, b=20, l=20, r=20))
                     st.plotly_chart(fig, width="stretch")
                     st.caption("Shaded: fantasy playoff weeks.")
                 with bc2:
-                    if cand["curve"]:
+                    if not faab_on:
+                        st.caption(f"🔢 {cand['bid_note']}")
+                    elif cand["curve"]:
                         curve_df = pd.DataFrame(cand["curve"], columns=["Bid ($)", "P(win)"])
                         fig = px.line(curve_df, x="Bid ($)", y="P(win)", title="Chance your claim wins, by bid")
                         fig.add_hline(y=TARGET_WIN_PROB, line_dash="dot", line_color="gray")
@@ -805,8 +983,10 @@ with tab_waivers:
                                       annotation_text=f"max ${cand['max_pay']}", annotation_position="bottom right")
                         fig.update_layout(height=320, margin=dict(t=50, b=20, l=20, r=20), yaxis_tickformat=".0%")
                         st.plotly_chart(fig, width="stretch")
+                    elif not cand["rivals"] and not rival_rosters:
+                        st.caption("No rival rosters in this league's sync, so the claim is treated as uncontested.")
                     else:
-                        st.caption("Rival bids weren't modeled for this player.")
+                        st.caption("Rival bids weren't modeled for this player (outside the top candidates).")
                 if cand["rivals"]:
                     with st.expander(f"👥 Who else wants him ({cand['interested_rivals']} of {len(cand['rivals'])} rivals)"):
                         st.dataframe(pd.DataFrame([{
@@ -875,8 +1055,10 @@ with tab_waivers:
                               annotation_text="Expected")
                 st.plotly_chart(fig, width="stretch")
 
-            with st.expander("🎲 Monte Carlo Simulation"):
-                waiver_samples = simulate_player(player_stats, selected_waiver)
+            # A toggle rather than an expander: expander bodies run even while collapsed
+            if st.toggle("🎲 Monte Carlo simulation", key="waiver_mc"):
+                center = proj_now(p_data)  # this week's projection, 0 on bye / out
+                waiver_samples = samples_for(p_data, player_stats, center)
                 smry = _summary(waiver_samples)
                 mc1, mc2, mc3, mc4 = st.columns(4)
                 mc1.metric("Floor (10th pct)", smry["floor"])
@@ -885,23 +1067,29 @@ with tab_waivers:
                 mc4.metric("Std Dev", smry["std"])
 
                 rc_map = {selected_waiver: waiver_samples}
-                if drop:
-                    rc_map[f"Drop: {drop['name']}"] = simulate_player(roster_stats[drop["name"]], drop["name"])
-                st.plotly_chart(_raincloud_fig(rc_map, "Simulated Outcome Distributions (10,000 games)"),
+                if drop_player:
+                    rc_map[f"Drop: {drop_player['name']}"] = samples_for(
+                        drop_player, roster_stats[pkey(drop_player)], proj_now(drop_player))
+                st.plotly_chart(_raincloud_fig(rc_map, "Simulated outcomes this week (10,000 games)"),
                                 width="stretch")
+                if ctx:
+                    st.caption(f"Centered on each player's week {week_now} projection, with the spread of his "
+                               "own weekly scores.")
 
             with st.expander("🤖 AI Narrative Analysis (optional)"):
-                st.caption("Needs `ANTHROPIC_API_KEY` or `GOOGLE_API_KEY` in .env.")
+                st.caption("Needs `ANTHROPIC_API_KEY` or `GOOGLE_API_KEY` in .env or Streamlit Secrets.")
                 ai_ctx = player_context(p_data, player_stats)
-                ai_ctx.update({"Generic value score": f"{ws['score']} ({ws['verdict']})",
-                               "Model FAAB bid": f"${bid_amount}"})
+                # With the engine, its CLAIM/PASS call is the verdict; the history score is context only
+                ai_ctx.update({"History value score (not roster-specific)": ws["score"] if engine
+                               else f"{ws['score']} ({ws['verdict']})",
+                               "Model FAAB bid": f"${bid_amount}" if faab_on else "No FAAB (waiver priority)"})
                 if cand:
                     ai_ctx.update({"Lineup gain for my roster": f"{cand['gain_per_week']} pts/wk, "
-                                                                f"{cand['gain_total']} rest of season",
+                                                                f"{cand['gain_total']} rest of season{WEIGHTED}",
                                    "Suggested drop": cand["drop_name"], "Max worth to me": f"${cand['max_pay']}",
                                    "Rival teams interested": cand["interested_rivals"],
                                    "Notes": candidate_notes(cand) or None})
-                _ai_block("ai_waiver", (selected_league, p_data.get("player_id") or selected_waiver),
+                _ai_block("ai_waiver", (selected_league, pkey(p_data), int(budget), scoring_key(scoring), week_now),
                           "Get AI Analysis",
                           lambda: FantasyAgent(st.session_state.ai_provider).analyze_waiver(
                               selected_waiver, player_stats, roster, scoring, budget, ai_ctx))
@@ -920,20 +1108,26 @@ with tab_planner:
         day = waiver_day(current_data.get("waiver_settings"))
         spend = sum(c["suggested_bid"] for c in plan)
         pc1, pc2, pc3, pc4 = st.columns(4)
-        pc1.metric("Budget left", f"${budget}")
-        pc2.metric("This plan spends", f"${spend}", f"${budget - spend} left after", delta_color="off")
+        if faab_on:
+            pc1.metric("Budget left", f"${budget}")
+            pc2.metric("This plan spends", f"${spend}", f"${budget - spend} left after", delta_color="off")
+        else:
+            pc1.metric("Waiver priority", f"#{my_waiver_pos}" if my_waiver_pos else "—")
+            pc2.metric("Claims in this plan", len(plan))
         pc3.metric("Weeks to go", engine["weeks_left"], help=f"Weeks {ctx.weeks[0]}–{ctx.weeks[-1]}, through the "
                                                              "fantasy championship. FAAB is worth nothing after that.")
         pc4.metric("Waivers process", day or "—")
-        if not faab_enabled:
-            st.caption("This league uses waiver priority, not FAAB — use the order below and ignore the dollar amounts.")
+        if not faab_on:
+            st.caption("This league uses waiver priority, not FAAB: submit the claims in the order below. "
+                       "P(win) is the chance no interested rival ahead of you in the order claims him first.")
 
         st.markdown(f"#### Claims to submit for week {week_now}")
         if plan:
             st.dataframe(pd.DataFrame([{
-                "Priority": c["priority"], "Add": c["name"], "Pos": c.get("position"), "Bid": c["suggested_bid"],
+                "Priority": c["priority"], "Add": c["name"], "Pos": c.get("position"),
+                **({"Bid": c["suggested_bid"]} if faab_on else {}),
                 "P(win)": c["p_win"] if c["p_win_known"] else None, "Drop": c["drop_name"] or "(open spot)",
-                "+Pts ROS": c["gain_total"],
+                f"+Pts ROS{WEIGHTED}": c["gain_total"],
                 "Alone": c["standalone_gain"] if c["standalone_gain"] != c["gain_total"] else None,
                 "Expected +pts": c["expected_gain"], "Notes": candidate_notes(c),
             } for c in plan]), hide_index=True, width="stretch",
@@ -944,15 +1138,18 @@ with tab_planner:
                                         "claims above it are assumed to go through.")})
             st.caption("Each claim is valued assuming the ones above it succeed, so the plan won't stack two "
                        "players for one lineup spot or drop someone you just added. Later claims are repriced at "
-                       "that smaller value. Expected +pts = P(win) × lineup gain. Bids aim for a "
-                       f"{TARGET_WIN_PROB:.0%} chance to win without paying more than the player is worth to you.")
+                       "that smaller value. Expected +pts = P(win) × lineup gain."
+                       + (f" Bids aim for a {TARGET_WIN_PROB:.0%} chance to win without paying more than the player "
+                          "is worth to you, re-bid from the budget the claims above leave." if faab_on else ""))
         else:
             st.info("No claim improves your lineup enough to be worth a bid this week.")
 
         mc1, mc2 = st.columns(2)
         with mc1:
             st.markdown("#### 📈 This league's FAAB market")
-            if profile["claims_won"]:
+            if not faab_on:
+                st.caption("No FAAB in this league — waiver claims go by priority order.")
+            elif profile["claims_won"]:
                 bt = profile["budget_total"]
                 pct = lambda k: f"${profile[k] * bt:.0f} ({profile[k]:.0%})" if profile.get(k) is not None else "—"
                 st.markdown("\n".join([
@@ -981,7 +1178,7 @@ with tab_planner:
                                    format="×%.2f", help="Average winning bid vs. the league average")})
             richer = sum(1 for r in current_data.get("league_rosters") or []
                          if r["roster_id"] != mine_id and r["faab_remaining"] > budget)
-            if richer:
+            if richer and faab_on:
                 st.caption(f"{richer} rival(s) have more FAAB than you"
                            + (" — target players few teams need rather than bidding wars." if richer >= 3 else "."))
 
@@ -1008,40 +1205,41 @@ with tab_start_sit:
     else:
         default_style = risk_mode(risk_p)
         sc1, sc2 = st.columns([3, 2])
-        selected_players = sc1.multiselect("Select 2–4 players to compare", list(roster_by_name), max_selections=4)
+        selected_ids = sc1.multiselect("Select 2–4 players to compare", list(roster_by_id), max_selections=4,
+                                       format_func=lambda k: roster_by_id[k]["name"])
         style = sc2.radio("Start/sit style", ["Safe", "Balanced", "Upside"], horizontal=True,
                           index=["Safe", "Balanced", "Upside"].index(default_style),
                           key=f"ss_style_{selected_league}",
                           help="Safe ranks by floor (10th percentile), Balanced by projection, Upside by ceiling "
-                               "(90th percentile)." + (f" Defaulted to {default_style}: you have a "
-                                                       f"{risk_p:.0%} chance to win this week"
-                                                       + (" (average of the head-to-head and median games)."
-                                                          if p_median is not None else ".")
-                                                       if risk_p is not None else ""))
+                               "(90th percentile).")
+        sc2.caption(f"Suggested this week: **{default_style}**"
+                    + (f" — you have a {risk_p:.0%} chance to win"
+                       + (" (average of the head-to-head and median games)." if p_median is not None else ".")
+                       if risk_p is not None else " (no matchup projection)."))
         if st.button("⚖️ Compare"):
-            st.session_state.ss_request = tuple(selected_players)
+            st.session_state.ss_request = tuple(selected_ids)
 
-        if len(selected_players) < 2:
+        if len(selected_ids) < 2:
             st.caption("Select at least 2 players.")
-        elif st.session_state.get("ss_request") != tuple(selected_players):
+        elif st.session_state.get("ss_request") != tuple(selected_ids):
             st.caption("Click **Compare** to run the analysis.")
         else:
-            named_stats = {n: roster_stats[n] for n in selected_players}
+            # Keyed by display name from here on (charts and the AI prompt use names)
+            selected_players = [roster_by_id[k]["name"] for k in selected_ids]
+            sel_by_name = {roster_by_id[k]["name"]: roster_by_id[k] for k in selected_ids}
+            named_stats = {n: roster_stats[pkey(p_obj)] for n, p_obj in sel_by_name.items()}
             matchups, injuries, projected, samples = {}, {}, {}, {}
-            for n in selected_players:
-                p_obj = roster_by_name[n]
+            for n, p_obj in sel_by_name.items():
                 next_g, m = matchup_for(p_obj)
                 matchups[n] = (next_g, m)
                 injuries[n] = inj_for(p_obj)
-                base = simulate_player(named_stats[n], n)
                 if ctx:
                     # Shape from his own weekly scores, centered on this week's projection
                     projected[n] = proj_now(p_obj)
-                    mean = float(np.mean(base))
-                    samples[n] = base * (projected[n] / mean) if mean > 0 else np.full_like(base, projected[n])
+                    samples[n] = samples_for(p_obj, named_stats[n], projected[n])
                 else:
                     mult = m["multiplier"] * injury_factor(injuries[n])
-                    samples[n] = base * mult
+                    samples[n] = samples_for(p_obj, named_stats[n]) * mult
                     projected[n] = round(float(np.mean(samples[n])), 2)
 
             summaries = {n: _summary(samples[n]) for n in selected_players}
@@ -1128,11 +1326,20 @@ with tab_start_sit:
 
             with st.expander("🤖 AI Narrative Analysis (optional — 2 players only)"):
                 if len(selected_players) == 2:
-                    p1, p2 = selected_players
-                    contexts = {n: player_context(roster_by_name[n], named_stats[n]) for n in (p1, p2)}
-                    _ai_block("ai_ss", (selected_league, p1, p2), "Get AI Analysis",
+                    contexts = {n: player_context(sel_by_name[n], named_stats[n]) for n in (p1, p2)}
+                    # The app's own verdict, so the narrative explains it rather than re-deriving from season PPG
+                    model_summary = {
+                        "Projection (this week)": f"{p1} {projected[p1]:.1f} vs {p2} {projected[p2]:.1f}",
+                        "Floor / ceiling": f"{p1} {summaries[p1]['floor']} / {summaries[p1]['ceiling']} vs "
+                                           f"{p2} {summaries[p2]['floor']} / {summaries[p2]['ceiling']}",
+                        "P(P1 outscores P2)": f"{p1_wins:.0%}",
+                        "Style": style,
+                        "App's pick": top["name"],
+                    }
+                    _ai_block("ai_ss", (selected_league, *selected_ids, style, week_now), "Get AI Analysis",
                               lambda: FantasyAgent(st.session_state.ai_provider).analyze_start_sit(
-                                  p1, p2, named_stats[p1], named_stats[p2], scoring, contexts))
+                                  p1, p2, named_stats[p1], named_stats[p2], scoring, contexts,
+                                  model_summary=model_summary))
                 else:
                     st.caption("AI narrative is only available for 2-player comparisons.")
 
@@ -1142,17 +1349,23 @@ with tab_start_sit:
 # ════════════════════════════════════════════════════════════════════════════
 with tab_trade:
     st.subheader("Trade Analyzer")
+    if not roster:
+        st.info("Sync a league to judge trades by your starting lineup. Without a roster, trades compare "
+                "value over replacement only.")
 
     deadline = current_data.get("trade_deadline")
-    to_deadline = weeks_until_deadline(deadline, week_now)
-    if to_deadline is not None and to_deadline < 0:
+    # Sleeper stores "no deadline" as a week past the regular season (e.g. 99)
+    no_deadline = bool(deadline) and int(deadline) > LAST_NFL_WEEK
+    to_deadline = None if no_deadline else weeks_until_deadline(deadline, week_now)
+    if no_deadline:
+        st.info("This league has no trade deadline.")
+    elif to_deadline is not None and to_deadline < 0:
         st.warning(f"The trade deadline (week {deadline}) has passed — trades are closed for this season.")
     elif to_deadline == 0:
         st.warning(f"This is the trade deadline week (week {deadline}).")
     elif to_deadline is not None:
         st.info(f"Trade deadline: week {deadline}, {to_deadline} week(s) away.")
 
-    rival_rosters = [r for r in current_data.get("league_rosters") or [] if r["roster_id"] != current_data.get("roster_id")]
     if ctx and rival_rosters and (to_deadline is None or to_deadline >= 0):
         with st.expander("🔎 Trade finder: 1-for-1 trades that help both teams"):
             st.caption("Tries swapping each of your top 12 players for each rival's top 12, and keeps trades that "
@@ -1166,77 +1379,98 @@ with tab_trade:
                 if ideas:
                     st.dataframe(pd.DataFrame([{
                         "Trade with": t["team"], "You give": f"{t['give']} ({t['give_pos']})",
-                        "You get": f"{t['get']} ({t['get_pos']})", "Your gain (ROS pts)": t["gain_me"],
-                        "Their gain (ROS pts)": t["gain_them"]} for t in ideas]), hide_index=True, width="stretch")
+                        "You get": f"{t['get']} ({t['get_pos']})", f"Your gain (ROS pts{WEIGHTED})": t["gain_me"],
+                        f"Their gain (ROS pts{WEIGHTED})": t["gain_them"]} for t in ideas]),
+                        hide_index=True, width="stretch")
                 else:
                     st.info("No 1-for-1 trade improves both lineups right now.")
 
     roster_ids = {p.get("player_id") for p in roster if p.get("player_id")}
     trade_pool = {p["player_id"]: p for p in _trade_pool if p["player_id"] not in roster_ids}
 
-    giving = st.multiselect("You Give (from your roster)", list(roster_by_name))
+    give_ids = st.multiselect("You Give (from your roster)", list(roster_by_id),
+                              format_func=lambda k: player_label(roster_by_id[k]))
     recv_ids = st.multiselect("You Receive", list(trade_pool),
                               format_func=lambda pid: player_label(trade_pool[pid]),
                               placeholder="Search any NFL player…")
+    give_players = [roster_by_id[k] for k in give_ids]
     receiving_players = [trade_pool[pid] for pid in recv_ids]
+    giving = [p["name"] for p in give_players]
     receiving = [p["name"] for p in receiving_players]
 
-    request = (selected_league, tuple(giving), tuple(p["player_id"] for p in receiving_players))
+    request = (selected_league, tuple(give_ids), tuple(recv_ids))
     if st.button("🤝 Analyze Trade", disabled=not (giving or receiving)):
         st.session_state.trade_request = request
 
     if (giving or receiving) and st.session_state.get("trade_request") == request:
-        give_players = [roster_by_name[n] for n in giving]
-        stats_map = {p["name"]: (roster_stats.get(p["name"]) or stats_for(p)) for p in give_players + receiving_players}
-        all_stats = {**roster_stats, **stats_map}
+        stats_map = {p["name"]: roster_stats.get(pkey(p)) or stats_for(p) for p in give_players + receiving_players}
+        all_stats = {**stats_by_name, **stats_map}
 
         missing = [n for n, s in stats_map.items() if not s["found"]]
         if missing:
             st.warning(f"No {_season_year} stats for: {', '.join(missing)} — valued at 0.")
 
-        trade = score_trade(roster, giving, receiving_players, all_stats, _repl_levels, roster_positions)
+        trade = score_trade(roster, giving, receiving_players, all_stats, _repl_levels, roster_positions, ctx=ctx)
+        # Simulations use this week's projection for each player (0 on bye / out) when there is one
+        centers = {p["name"]: proj_now(p) for p in roster + receiving_players} if ctx else None
         if trade["method"] == "lineup":
             mc = simulate_lineup_change([s["name"] for s in trade["before"]["starters"]],
-                                        [s["name"] for s in trade["after"]["starters"]], all_stats)
+                                        [s["name"] for s in trade["after"]["starters"]], all_stats, centers)
             p_better = mc["p_better"]
             rc = {"Lineup Before": mc["before_samples"], "Lineup After": mc["after_samples"]}
             rc_title = "Weekly Starting-Lineup Total (10,000 simulations)"
-            headline = (f"Starting lineup {trade['delta']:+.1f} pts/wk ({trade['delta_pct'] * 100:+.1f}%) · "
-                        f"P(better week) = {round(p_better * 100)}%")
         else:
-            mc = simulate_trade({n: stats_map[n] for n in giving}, {n: stats_map[n] for n in receiving})
+            mc = simulate_trade({n: stats_map[n] for n in giving}, {n: stats_map[n] for n in receiving}, centers)
             p_better = mc["p_receive_better"]
             rc = {"You Give": mc["give_samples"], "You Receive": mc["receive_samples"]}
             rc_title = "Total Weekly Output (10,000 simulations)"
-            headline = f"Value over replacement {trade['delta']:+.1f} pts/wk · P(receive side wins) = {round(p_better * 100)}%"
+
+        history_line = (f"Starting lineup {trade['history_delta']:+.1f} adj pts/wk "
+                        f"({trade['history_delta_pct']:+.1%}) by past production"
+                        if trade["method"] == "lineup" else
+                        f"Value over replacement {trade['history_delta']:+.1f} pts/wk")
+        if trade["basis"] == "projection":
+            headline = (f"Rest of season {trade['ros_delta']:+.1f} lineup pts ({trade['delta_pct']:+.1%}), "
+                        f"{trade['ros_delta_per_week']:+.1f}/wk · P(better week) = {round(p_better * 100)}%")
+        elif trade["method"] == "lineup":
+            headline = f"{history_line} · P(better week) = {round(p_better * 100)}%"
+        else:
+            headline = f"{history_line} · P(receive side wins) = {round(p_better * 100)}%"
 
         verdict = trade["verdict"]
         st.markdown(f"## :{verdict_color(verdict)}[{verdict}]  — {headline}")
-        if ctx:
-            # Same weekly projections as the waiver engine: who'd actually start, week by week, through the playoffs
-            before = lineup_totals(roster, ctx, roster_positions)
-            after = lineup_totals([p for p in roster if p["name"] not in giving]
-                                  + [{**p, "slot": "BN"} for p in receiving_players], ctx, roster_positions)
-            ros_delta = sum((after[w] - before[w]) * my_weights.get(w, 1.0) for w in ctx.weeks)
-            st.metric("Rest of season, from weekly projections", f"{ros_delta:+.1f} lineup pts",
+        if trade["basis"] == "projection":
+            ros_weighted = sum((trade["ros_after"][w] - trade["ros_before"][w]) * my_weights.get(w, 1.0)
+                               for w in ctx.weeks)
+            st.metric(f"Rest of season{WEIGHTED}", f"{ros_weighted:+.1f} lineup pts",
                       help=f"Your best lineup's projected points over weeks {ctx.weeks[0]}–{ctx.weeks[-1]}, "
                            "after vs. before, with playoff weeks counted by your playoff chances.")
-        st.caption("Verdict is based on your best possible starting lineup before vs. after the trade, so "
-                   "bench depth only counts if it would start. Value over replacement (VORP) is shown per player.")
+            st.caption(f"Verdict from your best starting lineup's weekly projections, weeks {ctx.weeks[0]}–"
+                       f"{ctx.weeks[-1]}. History view: **{trade['history_verdict']}** — {history_line}.")
+        else:
+            st.caption("Verdict is based on your best possible starting lineup before vs. after the trade, so "
+                       "bench depth only counts if it would start. Value over replacement (VORP) is shown per player.")
+        if trade["dropped"]:
+            st.warning(f"✂️ To stay within your {trade['roster_limit']}-player roster you'd have to cut: "
+                       f"{', '.join(trade['dropped'])} (counted in the after lineup).")
+        if trade["excluded"]:
+            st.caption(f"Not counted in either lineup (IR / TAXI): {', '.join(trade['excluded'])}.")
 
         vc1, vc2 = st.columns(2)
-        for col, side, header, total in [(vc1, trade["you_give"], "You Give", trade["give_vorp"]),
-                                         (vc2, trade["you_receive"], "You Receive", trade["recv_vorp"])]:
+        for col, players, side, header, total in [
+                (vc1, give_players, trade["you_give"], "You Give", trade["give_vorp"]),
+                (vc2, receiving_players, trade["you_receive"], "You Receive", trade["recv_vorp"])]:
             with col:
                 st.markdown(f"**{header}**")
-                for name, val in side.items():
-                    inj = inj_for(roster_by_name.get(name) or next(p for p in receiving_players if p["name"] == name))
-                    st.metric(f"{name}{f' 🏥 {inj}' if inj else ''}", f"{val['adj_value']} adj pts/wk",
+                for p in players:
+                    val = side[p["name"]]
+                    inj = inj_for(p)
+                    st.metric(f"{p['name']}{f' 🏥 {inj}' if inj else ''}", f"{val['adj_value']} adj pts/wk",
                               f"VORP {val['surplus']:+.1f}", delta_color="off")
                 st.metric("Total VORP", f"{total} pts/wk")
 
         if trade["method"] == "lineup":
-            with st.expander("Starting lineup before vs. after"):
+            with st.expander("Starting lineup before vs. after (past production)"):
                 lc1, lc2 = st.columns(2)
                 for col, key, title in [(lc1, "before", "Before"), (lc2, "after", "After")]:
                     lineup = trade[key]
@@ -1254,8 +1488,7 @@ with tab_trade:
 
         st.plotly_chart(_raincloud_fig(rc, rc_title), width="stretch")
 
-        wk_str = "–".join(str(w) for w in (playoff_weeks[0], playoff_weeks[-1]))
-        with st.expander(f"📅 Playoff Schedule Strength (Weeks {wk_str})"):
+        with st.expander(f"📅 Playoff Schedule Strength (Weeks {playoff_weeks[0]}–{playoff_weeks[-1]})"):
             psc1, psc2 = st.columns(2)
             for col, players, header in [(psc1, give_players, "You Give"), (psc2, receiving_players, "You Receive")]:
                 with col:
@@ -1271,6 +1504,8 @@ with tab_trade:
         with st.expander("🤖 AI Narrative Analysis (optional)"):
             contexts = {p["name"]: player_context(p, stats_map[p["name"]]) for p in give_players + receiving_players}
             summary = {"Verdict": verdict, "Lineup / value change": headline,
+                       "History-based view": f"{trade['history_verdict']}: {history_line}",
+                       "Players cut to fit the roster": ", ".join(trade["dropped"]) or None,
                        "VORP given": trade["give_vorp"], "VORP received": trade["recv_vorp"]}
             _ai_block("ai_trade", request, "Get AI Verdict",
                       lambda: FantasyAgent(st.session_state.ai_provider).analyze_trade(
@@ -1292,19 +1527,23 @@ with tab_roster_mgmt:
                       if w.get("position") in {"QB", "RB", "WR", "TE"} and not is_inactive(inj_for(w))]
         avail_stats = {p["name"]: stats_for(p) for p in avail_pool}
         avail_mults = {p["name"]: matchup_for(p)[1]["multiplier"] for p in avail_pool}
-        analysis = analyze_roster_construction(roster, avail_pool, roster_stats, avail_stats,
+        analysis = analyze_roster_construction(roster, avail_pool, stats_by_name, avail_stats,
                                                _repl_levels, avail_mults, roster_positions)
 
         pg = analysis["position_grades"]
         weaknesses = analysis["weaknesses"]
 
         st.markdown("### Positional Strength")
-        grade_cols = st.columns(len(pg))
-        for col, (pos, g) in zip(grade_cols, pg.items()):
-            col.metric(pos, f"Grade {g['grade']}", f"×{g['strength_ratio']:.2f} vs replacement")
-            col.caption(f"{g['depth_count']} players · starters avg {g['avg_starter_val']:.1f} adj pts")
-        st.caption("Graded positions follow this league's lineup slots. DEF isn't graded — "
-                   "team defense stats aren't in the nflverse data.")
+        if pg:
+            graded = list(pg.items())
+            for i in range(0, len(graded), 3):  # three per row, so narrow screens stay readable
+                for col, (pos, g) in zip(st.columns(3), graded[i:i + 3]):
+                    col.metric(pos, f"Grade {g['grade']}", f"×{g['strength_ratio']:.2f} vs replacement")
+                    col.caption(f"{g['depth_count']} players · starters avg {g['avg_starter_val']:.1f} adj pts")
+            st.caption("Graded positions follow this league's lineup slots. DEF isn't graded — "
+                       "team defense stats aren't in the nflverse data.")
+        else:
+            st.caption("This league's lineup has no position-specific slots to grade.")
 
         if weaknesses:
             st.warning(f"⚠️ Positional weaknesses: **{', '.join(weaknesses)}** — prioritized in recommendations below")
@@ -1312,13 +1551,27 @@ with tab_roster_mgmt:
             st.success("✅ No critical positional weaknesses")
 
         st.divider()
-        st.markdown("### Need-Adjusted Waiver Targets")
-        st.caption("Score = waiver score (incl. next-game matchup) + need bonus (up to +20 for filling a weakness)")
-
-        targets = analysis["targeted_adds"]
-        if targets:
+        need_pct = {pos: {"F": 0.20, "D": 0.12}.get(pg[pos]["grade"], 0.0) for pos in weaknesses}
+        if engine:
+            # Same lineup-gain math as the Waivers tab, boosted where the roster is weak
+            st.markdown("### Need-Adjusted Waiver Targets")
+            st.caption(f"Score = projected lineup gain per week{WEIGHTED} from the Waivers tab, +20% at a position "
+                       "graded F and +12% at D.")
+            target_rows = [{
+                "Player": c["name"], "Pos": c.get("position", ""), "Team": c.get("team", ""),
+                "Need Score": round(c["gain_per_week"] * (1 + need_pct.get(c.get("position"), 0.0)), 2),
+                "Base Score": c["gain_per_week"],
+                "Fills Need": "⭐ YES" if c.get("position") in weaknesses else "—",
+                "Drop": c["drop_name"] or "(open spot)",
+                "Injury": inj_for(c) or "",
+            } for c in engine["candidates"] if c["gain_total"] > 0 and c.get("position") in pg]
+            y_label = "+Pts/wk"
+        else:
+            st.markdown("### Need-Adjusted Waiver Targets (history-only)")
+            st.caption("No current week to project, so this uses past production: score = generic waiver score "
+                       "(incl. next-game matchup) + need bonus (up to +20 for filling a weakness)")
             target_rows = []
-            for t in targets:
+            for t in analysis["targeted_adds"]:
                 next_g, _ = matchup_for(t)
                 target_rows.append({
                     "Player": t["name"], "Pos": t.get("position", ""), "Team": t.get("team", ""),
@@ -1328,13 +1581,16 @@ with tab_roster_mgmt:
                     "Next Game": f"vs {next_g['opponent']}" if next_g else None,
                     "Injury": inj_for(t) or "",
                 })
+            y_label = "Score"
+
+        if target_rows:
             df_targets = pd.DataFrame(target_rows).sort_values("Need Score", ascending=False)
             st.dataframe(df_targets, hide_index=True, width="stretch", column_config=_INJURY_COL)
 
             fig = px.bar(df_targets.head(10), x="Player", y=["Need Score", "Base Score"],
-                         barmode="overlay", title="Need-Adjusted vs Base Waiver Score",
-                         labels={"value": "Score", "variable": ""},
+                         barmode="overlay", title="Need-Adjusted vs Base Score",
+                         labels={"value": y_label, "variable": ""},
                          color_discrete_map={"Need Score": "steelblue", "Base Score": "lightgray"})
             st.plotly_chart(fig, width="stretch")
         else:
-            st.info("No available players found — sync your league to populate the waiver pool.")
+            st.info("No available players found that would improve your lineup at a graded position.")
